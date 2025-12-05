@@ -1,6 +1,6 @@
 # Brainwires Studio
 
-**High-performance AI infrastructure for research, code intelligence, and multi-provider API access.**
+**High-performance AI infrastructure for general use, research, code intelligence, and multi-provider API access.**
 
 Brainwires Studio is a unified platform combining a web app, CLI/TUI, and browser extension—all powered by custom Rust engines compiled to WebAssembly. The public repositories here represent a curated slice of the full platform; more components will be open-sourced as the project matures.
 
