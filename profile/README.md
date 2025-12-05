@@ -14,7 +14,6 @@ A **Next.js 16 Progressive Web App** powering [brainwires.studio](https://brainw
 
 - **Multi-Provider AI Chat** — OpenAI, Anthropic Claude, Google Gemini, Mistral, Groq with streaming responses
 - **Workspace Management** — Team workspaces with role-based access control
-- **Rich Text Support** — Lexical-based editor with math rendering (KaTeX/MathJax)
 - **Private RAG** — Client-side document search using local embeddings
 - **MCP Integration** — Model Context Protocol servers for extended AI capabilities
 - **Internationalization** — Full i18n support with i18next
