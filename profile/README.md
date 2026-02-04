@@ -29,6 +29,16 @@ A **Next.js 16 Progressive Web App** powering [brainwires.studio](https://brainw
 
 The studio integrates several high-performance Rust modules compiled to WebAssembly:
 
+### Thalora Web Browser ![lock](lock.svg)
+
+A **full-featured pure Rust headless browser** designed for AI agents. **Binary-only closed source.**
+
+- Chrome 131 compatibility with real JavaScript execution
+- Modern Web APIs (Fetch, WebRTC, WebAssembly, Service Workers, WebGL)
+- AI Memory Heap for persistent context across sessions
+- 17+ MCP tools plus Chrome DevTools Protocol integration
+- Native and WASM builds, single-binary deployment
+
 ### Computational Engine ![globe](globe.svg)
 
 A comprehensive mathematical and scientific computing library providing **400+ operations** through a unified **10-tool API**.
@@ -39,16 +49,6 @@ A comprehensive mathematical and scientific computing library providing **400+ o
 - Multiple interfaces: Native Rust API, JSON/MCP Server, WebAssembly
 
 **Tools:** `Solve` | `Differentiate` | `Integrate` | `Analyze` | `Simulate` | `Compute` | `Transform` | `FieldTheory` | `Sample` | `Optimize`
-
-### Thalora Web Browser ![lock](lock.svg)
-
-A **full-featured pure Rust headless browser** designed for AI agents. **Binary-only closed source.**
-
-- Chrome 131 compatibility with real JavaScript execution
-- Modern Web APIs (Fetch, WebRTC, WebAssembly, Service Workers, WebGL)
-- AI Memory Heap for persistent context across sessions
-- 17+ MCP tools plus Chrome DevTools Protocol integration
-- Native and WASM builds, single-binary deployment
 
 ### Tool Orchestrator ![globe](globe.svg)
 
