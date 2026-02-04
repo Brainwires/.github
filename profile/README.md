@@ -2,11 +2,11 @@
 
 **High-performance AI infrastructure for general use, research, code intelligence, and multi-provider API access.**
 
-Brainwires Studio is a full-stack AI platform for research, coding, and agent automation, centered on three primary apps: the Next.js web experience, the Brainwires CLI/TUI, and the Thalora headless browser. The web app, CLI, and Thalora are closed source (the CLI and Thalora ship as binary-only releases); the open repositories focus on supporting engines, agent tooling, and selected infrastructure forks used in production.
+Brainwires Studio is a full-stack AI platform for research, coding, and agent automation, centered on three primary apps: the Next.js web experience, the Brainwires CLI/TUI, and the Thalora headless browser. The web app, CLI, and Thalora ship as binary-only releases; the public repos focus on supporting engines, agent tooling, and selected infrastructure forks used in production.
 
 ---
 
-## Web App (Closed Source)
+## Web App ![lock](lock.svg)
 
 A **Next.js 16 Progressive Web App** powering [brainwires.studio](https://brainwires.studio).
 
@@ -29,7 +29,7 @@ A **Next.js 16 Progressive Web App** powering [brainwires.studio](https://brainw
 
 The studio integrates several high-performance Rust modules compiled to WebAssembly:
 
-### Computational Engine
+### Computational Engine ![globe](globe.svg)
 
 A comprehensive mathematical and scientific computing library providing **400+ operations** through a unified **10-tool API**.
 
@@ -40,9 +40,9 @@ A comprehensive mathematical and scientific computing library providing **400+ o
 
 **Tools:** `Solve` | `Differentiate` | `Integrate` | `Analyze` | `Simulate` | `Compute` | `Transform` | `FieldTheory` | `Sample` | `Optimize`
 
-### Thalora Web Browser
+### Thalora Web Browser ![lock](lock.svg)
 
-A **full-featured pure Rust headless browser** designed for AI agents. **Binary-only, closed source.**
+A **full-featured pure Rust headless browser** designed for AI agents. **Binary-only closed source.**
 
 - Chrome 131 compatibility with real JavaScript execution
 - Modern Web APIs (Fetch, WebRTC, WebAssembly, Service Workers, WebGL)
@@ -50,7 +50,7 @@ A **full-featured pure Rust headless browser** designed for AI agents. **Binary-
 - 17+ MCP tools plus Chrome DevTools Protocol integration
 - Native and WASM builds, single-binary deployment
 
-### Tool Orchestrator
+### Tool Orchestrator ![globe](globe.svg)
 
 Universal **Programmatic Tool Calling** implementation for any LLM.
 
@@ -59,7 +59,7 @@ Universal **Programmatic Tool Calling** implementation for any LLM.
 - Sandboxed execution with configurable safety limits
 - Native Rust + WASM (browser/Node.js) targets
 
-### Local LLM
+### Local LLM ![globe](globe.svg)
 
 Client-side LLM inference engine with hybrid local/cloud support.
 
@@ -68,7 +68,7 @@ Client-side LLM inference engine with hybrid local/cloud support.
 - Smart storage with File System API + Cache API
 - Curated model catalog (1B-8B params) with q4/q8 quantization
 
-### Vector Database
+### Vector Database ![globe](globe.svg)
 
 High-performance client-side vector database.
 
@@ -79,7 +79,7 @@ High-performance client-side vector database.
 
 ---
 
-## Browser Extension
+## Browser Extension ![lock](lock.svg)
 
 **Brainwires Extension** — Client-side compute for brainwires.studio.
 
@@ -92,9 +92,9 @@ High-performance client-side vector database.
 
 ---
 
-## Brainwires CLI
+## Brainwires CLI ![lock](lock.svg)
 
-An **AI-powered agentic CLI tool** for autonomous coding assistance. **Binary-only, closed source.**
+An **AI-powered agentic CLI tool** for autonomous coding assistance. **Binary-only closed source.**
 
 - Multi-agent architecture with orchestrator/worker roles
 - Rich tool system: file ops, bash, git, web operations
@@ -107,7 +107,7 @@ An **AI-powered agentic CLI tool** for autonomous coding assistance. **Binary-on
 
 ---
 
-## Public Repositories (All)
+## Public Repositories ![globe](globe.svg)
 
 Below is the full list of public repos in the Brainwires org, with a short note on what they are and why they exist.
 
@@ -156,7 +156,7 @@ Below is the full list of public repos in the Brainwires org, with a short note 
 **What:** Supabase Postgres fork with Spock multi-master replication support.
 **Why:** Used for pgEdge deployments (Spock = multi-master replication).
 
-### [supabase-cli](https://github.com/Brainwires/supabase-cli)
+### [supabase-cli](https://github.com/Brainwires/supabase-cli) 
 
 **What:** Supabase CLI fork (migrations, local dev, edge functions, backups).
 **Why:** Maintained to support pgEdge/Spock workflows and custom patches.
@@ -176,7 +176,6 @@ Below is the full list of public repos in the Brainwires org, with a short note 
 ## Philosophy
 
 - **Performance First** — All core projects are written in Rust for maximum speed and safety
-- **Local-First** — No external API dependencies; everything runs on your machine
 - **AI-Native** — Built for seamless integration with AI assistants via MCP
 - **Full-Stack Ownership** — We build the browser, the compute engine, the CLI, and the web app
 
