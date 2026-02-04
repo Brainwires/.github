@@ -2,7 +2,7 @@
 
 **High-performance AI infrastructure for general use, research, code intelligence, and multi-provider API access.**
 
-Brainwires Studio is a full-stack AI platform for research, coding, and agent automation, spanning a web app, CLI/TUI, browser extension, and a VS Code extension. The ecosystem is anchored by high-performance Rust engines for computation, browser automation, and programmatic tool calling, with MCP providing the shared protocol layer. Advanced capabilities include a dedicated compute engine, local model support, and Project RAG for retrieval-augmented workflows. Some flagship apps are shipped as binary-only, closed source releases, while core engines and infrastructure are open for reuse and audit. The public repositories here reflect that split: foundational engines, agent tooling, and selected infrastructure forks used in production.
+Brainwires Studio is a full-stack AI platform for research, coding, and agent automation, centered on three primary apps: the Next.js web experience, the Brainwires CLI/TUI, and the Thalora headless browser. The web app, CLI, and Thalora are closed source (the CLI and Thalora ship as binary-only releases); the open repositories focus on supporting engines, agent tooling, and selected infrastructure forks used in production.
 
 ---
 
