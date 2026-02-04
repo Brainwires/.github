@@ -2,7 +2,7 @@
 
 **High-performance AI infrastructure for general use, research, code intelligence, and multi-provider API access.**
 
-Brainwires Studio is a unified platform combining a web app, CLI/TUI, and browser extension—all powered by custom Rust engines compiled to WebAssembly. The public repositories here represent a curated slice of the full platform; more components will be open-sourced as the project matures.
+Brainwires Studio is a full-stack AI platform for research, coding, and agent automation, spanning a web app, CLI/TUI, browser extension, and a VS Code extension. The ecosystem is anchored by high-performance Rust engines for computation, browser automation, and programmatic tool calling, with MCP providing the shared protocol layer. Advanced capabilities include a dedicated compute engine, local model support, and Project RAG for retrieval-augmented workflows. Some flagship apps are shipped as binary-only, closed source releases, while core engines and infrastructure are open for reuse and audit. The public repositories here reflect that split: foundational engines, agent tooling, and selected infrastructure forks used in production.
 
 ---
 
@@ -42,14 +42,13 @@ A comprehensive mathematical and scientific computing library providing **400+ o
 
 ### Thalora Web Browser
 
-A **full-featured pure Rust headless browser** designed for AI agents.
+A **full-featured pure Rust headless browser** designed for AI agents. **Binary-only, closed source.**
 
-- Real Chrome 131 mimicking with complete browser fingerprinting
-- Advanced JavaScript engine (Boa) with ES2017-2025 support
-- 50+ modern Web APIs: WebRTC, WebAssembly, Service Workers, WebGL, Media APIs
-- AI Memory Heap for persistent storage across context compression
-- 17+ MCP tools with Chrome DevTools Protocol integration
-- Single binary deployment — no Chrome/Chromium dependencies
+- Chrome 131 compatibility with real JavaScript execution
+- Modern Web APIs (Fetch, WebRTC, WebAssembly, Service Workers, WebGL)
+- AI Memory Heap for persistent context across sessions
+- 17+ MCP tools plus Chrome DevTools Protocol integration
+- Native and WASM builds, single-binary deployment
 
 ### Tool Orchestrator
 
@@ -95,41 +94,82 @@ High-performance client-side vector database.
 
 ## Brainwires CLI
 
-An **AI-powered agentic CLI tool** for autonomous coding assistance.
+An **AI-powered agentic CLI tool** for autonomous coding assistance. **Binary-only, closed source.**
 
-- Multi-agent architecture with task decomposition
+- Multi-agent architecture with orchestrator/worker roles
 - Rich tool system: file ops, bash, git, web operations
-- MCP client for extended functionality
-- Multiple modes: interactive, single-shot, batch, TUI, MCP server
-- Infinite context via entity extraction and semantic search
-- Task management with dependencies and time tracking
-- Plan branching, templates, and semantic search
+- MCP client plus MCP server mode
+- Interactive, single-shot, batch, and TUI chat modes
+- Multiple output formats and quiet mode for scripting
+- Planning mode, task management, plan branching/templates
+- Infinite context memory with entity graphs and semantic search
+- Remote control via Brainwires Studio web interface
 
 ---
 
-## Public Repositories
+## Public Repositories (All)
 
-### [Compute Engine](https://github.com/Brainwires/compute-engine)
+Below is the full list of public repos in the Brainwires org, with a short note on what they are and why they exist.
 
-The standalone computational engine — available for use in your own projects.
+### [compute-engine](https://github.com/Brainwires/compute-engine)
 
-### [Project RAG](https://github.com/Brainwires/project-rag)
+**What:** Standalone computational engine with 400+ mathematical operations.
+**Why:** Core math engine powering Brainwires tools, open for reuse and audits.
 
-A Rust-based MCP server providing AI assistants with RAG capabilities for understanding massive codebases.
+### [project-rag](https://github.com/Brainwires/project-rag)
 
-- Hybrid search: vector similarity + BM25 keyword matching
-- AST-based semantic chunking for 12+ languages
-- 40+ file types with automatic PDF-to-Markdown
-- Git history search with on-demand indexing
+**What:** Rust MCP server for RAG over large codebases.
+**Why:** Provides semantic search + retrieval infrastructure for assistants.
 
-### [Tool Orchestrator](https://github.com/Brainwires/tool-orchestrator)
+### [tool-orchestrator](https://github.com/Brainwires/tool-orchestrator)
 
-Universal Programmatic Tool Calling for any LLM — implement Anthropic's PTC pattern with any model.
+**What:** Programmatic Tool Calling (PTC) implementation for any LLM.
+**Why:** Cuts token usage and enforces structured tool routing across models.
 
-- 37-98% token reduction via Rhai script orchestration
-- Model-agnostic: Claude, OpenAI, Gemini, local models
-- Sandboxed execution with configurable safety limits
-- Native Rust + WASM (browser/Node.js) targets
+### [mcp-secure-shell](https://github.com/Brainwires/mcp-secure-shell)
+
+**What:** Rust MCP server exposing SSH/SCP workflows as tools.
+**Why:** Safe, auditable remote operations for agents and deployments.
+
+### [lazarus-mcp](https://github.com/Brainwires/lazarus-mcp)
+
+**What:** MCP server that can restart Claude Code during MCP updates.
+**Why:** Solves self-restart deadlocks when an MCP updates itself.
+
+### [ratatui-interact](https://github.com/Brainwires/ratatui-interact)
+
+**What:** Interactive TUI primitives for Ratatui.
+**Why:** Powers the Brainwires CLI/TUI UX with reusable components.
+
+### [react-skia-pack](https://github.com/Brainwires/react-skia-pack)
+
+**What:** GPU-accelerated React components built on Skia/CanvasKit.
+**Why:** High-performance data visualization for web UIs.
+
+### [selfhosted-supabase-mcp](https://github.com/Brainwires/selfhosted-supabase-mcp)
+
+**What:** MCP server for self-hosted Supabase deployments.
+**Why:** Bridges agent tooling with our internal Supabase stacks.
+
+### [supabase-postgres-spock](https://github.com/Brainwires/supabase-postgres-spock)
+
+**What:** Supabase Postgres fork with Spock multi-master replication support.
+**Why:** Used for pgEdge deployments (Spock = multi-master replication).
+
+### [supabase-cli](https://github.com/Brainwires/supabase-cli)
+
+**What:** Supabase CLI fork (migrations, local dev, edge functions, backups).
+**Why:** Maintained to support pgEdge/Spock workflows and custom patches.
+
+### [supabase-supabase](https://github.com/Brainwires/supabase-supabase)
+
+**What:** Supabase platform repo (dashboard, infra, tooling).
+**Why:** Source-of-truth fork for pgEdge-specific integration work.
+
+### [next-pwa](https://github.com/Brainwires/next-pwa)
+
+**What:** Next.js PWA plugin fork.
+**Why:** Maintains compatibility fixes and build tweaks for our web app.
 
 ---
 
