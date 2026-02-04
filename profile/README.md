@@ -12,7 +12,7 @@ A **Next.js 16 Progressive Web App** powering [brainwires.studio](https://brainw
 
 ### Core Features
 
-- **Multi-Provider AI Chat** — OpenAI, Anthropic Claude, Google Gemini, Groq with streaming responses
+- **Multi-Provider AI Chat** — OpenAI, Anthropic Claude, Google Gemini, and Groq
 - **Workspace Management** — Team workspaces with role-based access control
 - **Private RAG** — Client-side document search using local embeddings
 - **MCP Integration** — Model Context Protocol servers for extended AI capabilities
