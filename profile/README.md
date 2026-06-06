@@ -1,189 +1,87 @@
-# Brainwires Studio
+# Brainwires
 
-**High-performance AI infrastructure for general use, research, code intelligence, and multi-provider API access.**
+**High-performance, AI-native infrastructure written in Rust.**
 
-Brainwires Studio is a full-stack AI platform for research, coding, and agent automation, centered on three primary apps: the Next.js web experience, the Brainwires CLI/TUI, and the Thalora headless browser. The web app, CLI, and Thalora ship as binary-only releases; the public repos focus on supporting engines, agent tooling, and selected infrastructure forks used in production.
-
----
-
-## Web App ![lock](lock.svg)
-
-A **Next.js 16 Progressive Web App** powering [brainwires.studio](https://brainwires.studio).
-
-### Core Features
-
-- **Multi-Provider AI Chat** — OpenAI, Anthropic Claude, Google Gemini, and Groq
-- **Workspace Management** — Team workspaces with role-based access control
-- **Private RAG** — Client-side document search using local embeddings
-- **MCP Integration** — Model Context Protocol servers for extended AI capabilities
-- **Internationalization** — Full i18n support with i18next
-- **PWA & Offline** — Service worker caching, installable app
-
-### Tech Stack
-
-`Next.js 16` | `React 19` | `TypeScript` | `Supabase` | `Tailwind CSS` | `shadcn/ui`
+We build tools that think alongside you — browser-resident model inference, an agent framework, a pure-Rust browser for AI, and a handful of focused libraries. Almost everything is Rust, much of it compiled to WebAssembly so it runs client-side with no server round-trip.
 
 ---
 
-## Rust Submodules
+## Flagship Products
 
-The studio integrates several high-performance Rust modules compiled to WebAssembly:
+### [Rullama](https://github.com/Brainwires/rullama) ![globe](globe.svg)
 
-### Thalora Web Browser ![lock](lock.svg)
+**Browser-resident Gemma 4 inference in pure Rust → WebAssembly + WebGPU.**
 
-A **full-featured pure Rust headless browser** designed for AI agents. **Binary-only closed source.**
+Loads the same GGUF blobs Ollama already has on disk and runs the forward pass on your local GPU through hand-written WGSL — never touching a remote server. A PWA-pluggable inference engine, not a port of Ollama-the-server.
 
-- Chrome 131 compatibility with real JavaScript execution
-- Modern Web APIs (Fetch, WebRTC, WebAssembly, Service Workers, WebGL)
-- AI Memory Heap for persistent context across sessions
-- 17+ MCP tools plus Chrome DevTools Protocol integration
-- Native and WASM builds, single-binary deployment
+- Greedy output bit-identical to Ollama (`gemma4:e2b`, validated on desktop)
+- Runs on-device: full Q4_K_M model streaming tokens on an iPhone 16e
+- Vision + audio multimodal (ViT + Conformer towers on the same wgpu device)
+- In-browser LoRA fine-tuning — backward kernels, Adam over GPU buffers, adapters export as safetensors
+- Streaming load via HTTP byte-range or OPFS sync handles — the 7 GB GGUF never enters wasm linear memory in bulk
 
-### Computational Engine ![globe](globe.svg)
+### [Brainwires Framework](https://github.com/Brainwires/brainwires-framework) ![globe](globe.svg)
 
-A comprehensive mathematical and scientific computing library providing **400+ operations** through a unified **10-tool API**.
+**A modular Rust framework for building complete AI solutions.** A workspace of 32 framework crates (plus extras), each independently publishable to crates.io and composable through the `brainwires` facade crate. A subset is ported to Deno.
 
-- Custom Computer Algebra System (CAS) with no Python dependencies
-- 1,685 tests with 100% pass rate and 83%+ code coverage
-- Covers 24+ mathematical domains: calculus, linear algebra, tensor calculus, differential equations, quantum mechanics
-- Multiple interfaces: Native Rust API, JSON/MCP Server, WebAssembly
+- **Multi-provider AI** — Anthropic, OpenAI, Google, Ollama, and local LLMs behind a unified `Provider` trait
+- **Agent orchestration** — hierarchical task decomposition, multi-agent coordination, MDAP voting
+- **MCP protocol** — full client and server support, exposing agents as MCP tools
+- **Agent networking** — 5-layer protocol stack (IPC, TCP, A2A, Pub/Sub) with pluggable transports
+- **Training** — cloud fine-tuning across 6 providers plus local LoRA/QLoRA/DoRA via Burn
+- **RAG & code search** — AST-aware chunking, hybrid vector + keyword search, Git-aware indexing
+- **Audio & security** — STT/TTS, encrypted storage (ChaCha20-Poly1305), permission policies
 
-**Tools:** `Solve` | `Differentiate` | `Integrate` | `Analyze` | `Simulate` | `Compute` | `Transform` | `FieldTheory` | `Sample` | `Optimize`
+[`crates.io/crates/brainwires`](https://crates.io/crates/brainwires) · [`docs.rs/brainwires`](https://docs.rs/brainwires) · [brainwires.dev](https://brainwires.dev/)
 
-### Tool Orchestrator ![globe](globe.svg)
+### [Thalora](https://github.com/Brainwires/thalora-web-browser) ![globe](globe.svg)
 
-Universal **Programmatic Tool Calling** implementation for any LLM.
+**A full-featured pure-Rust headless web browser designed for AI agents.** Complete Chrome 131 compatibility with real JavaScript execution and modern web APIs — no Chrome or Chromium dependency.
 
-- 37-98% token reduction via Rhai script orchestration
-- Model-agnostic: works with Claude, OpenAI, Gemini, local models
-- Sandboxed execution with configurable safety limits
-- Native Rust + WASM (browser/Node.js) targets
+- **Real JS engine** — Boa with ES2017–2025 support; no mocks, no fake timers
+- **Modern Web APIs** — Fetch, WebSocket, WebRTC, WebAssembly, Service Workers, WebGL, Web Crypto, device APIs
+- **AI-first** — persistent AI Memory Heap that survives context compression, 17+ MCP tools, Chrome DevTools Protocol
+- **Single binary** — no dependencies, deploy anywhere; passes Google's anti-bot protection
 
-### Local LLM ![globe](globe.svg)
-
-Client-side LLM inference engine with hybrid local/cloud support.
-
-- WebGPU acceleration (80% native performance)
-- Intelligent fallback: WebGPU → WASM → Cloud
-- Smart storage with File System API + Cache API
-- Curated model catalog (1B-8B params) with q4/q8 quantization
-
-### Vector Database ![globe](globe.svg)
-
-High-performance client-side vector database.
-
-- WASM-accelerated with near-native performance
-- HNSW index for approximate nearest neighbor search
-- Automatic IndexedDB persistence
-- Cosine similarity, Euclidean distance, dot product
+[`crates.io/crates/thalora`](https://crates.io/crates/thalora) · [`docs.rs/thalora`](https://docs.rs/thalora) · 658 tests passing
 
 ---
 
-## Browser Extension ![lock](lock.svg)
+## Smaller Projects
 
-**Brainwires Extension** — Client-side compute for brainwires.studio.
+### [rsqlite-wasm](https://github.com/Brainwires/rsqlite-wasm) ![globe](globe.svg)
 
-- **Offload heavy computation** — Run tools locally instead of paying server costs
-- Run AI models locally with WebGPU acceleration
-- 400+ math operations via Computational Engine WASM
-- Web scraping and content extraction via Thalora
-- Chrome (Manifest V3) and Firefox support
-- Zero telemetry — all compute stays on your machine
+WASM implementation of SQLite with vector-database support, written in Rust. Powers the SQLite tooling across our browser-side stack.
 
----
+### [opfs-extension](https://github.com/Brainwires/opfs-extension) ![globe](globe.svg)
 
-## Brainwires CLI ![lock](lock.svg)
+**Brainwires OPFS** — a Chrome DevTools extension for browsing, editing, uploading, and exporting files in any origin's Origin Private File System. Includes a full SQLite IDE (schema browser, data grid, SQL console) powered by rsqlite-wasm. No telemetry, no remote code. Install with `npx brainwires-opfs`.
 
-An **AI-powered agentic CLI tool** for autonomous coding assistance. **Binary-only closed source.**
+### [ratatui-interact](https://github.com/Brainwires/ratatui-interact) ![globe](globe.svg)
 
-- Multi-agent architecture with orchestrator/worker roles
-- Rich tool system: file ops, bash, git, web operations
-- MCP client plus MCP server mode
-- Interactive, single-shot, batch, and TUI chat modes
-- Multiple output formats and quiet mode for scripting
-- Planning mode, task management, plan branching/templates
-- Infinite context memory with entity graphs and semantic search
-- Remote control via Brainwires Studio web interface
+Interactive TUI components for [ratatui](https://github.com/ratatui/ratatui) — focus management (Tab/Shift+Tab), mouse click hit-testing, and a library of ready-to-use widgets (Input, Select, TreeView, FileExplorer, TabView, and more). [`crates.io/crates/ratatui-interact`](https://crates.io/crates/ratatui-interact)
 
----
+### [ParolNet](https://github.com/Brainwires/parol-social) ![globe](globe.svg)
 
-## Public Repositories ![globe](globe.svg)
+A secure, decentralized communication platform promoting free expression and open access to information — built for people living under authoritarian regimes. No phone number, email, or account; your identity is a cryptographic key that never leaves your device. Traffic camouflage, onion-routed conversations, panic wipe, and decoy mode. *(Active prototype — see the repo's `IMPLEMENTATION_STATUS.md`.)*
 
-Below is the full list of public repos in the Brainwires org, with a short note on what they are and why they exist.
+### [react-skia-pack](https://github.com/Brainwires/react-skia-pack) ![globe](globe.svg)
 
-### [compute-engine](https://github.com/Brainwires/compute-engine)
-
-**What:** Standalone computational engine with 400+ mathematical operations.
-**Why:** Core math engine powering Brainwires tools, open for reuse and audits.
-
-### [project-rag](https://github.com/Brainwires/project-rag)
-
-**What:** Rust MCP server for RAG over large codebases.
-**Why:** Provides semantic search + retrieval infrastructure for assistants.
-
-### [tool-orchestrator](https://github.com/Brainwires/tool-orchestrator)
-
-**What:** Programmatic Tool Calling (PTC) implementation for any LLM.
-**Why:** Cuts token usage and enforces structured tool routing across models.
-
-### [mcp-secure-shell](https://github.com/Brainwires/mcp-secure-shell)
-
-**What:** Rust MCP server exposing SSH/SCP workflows as tools.
-**Why:** Safe, auditable remote operations for agents and deployments.
-
-### [lazarus-mcp](https://github.com/Brainwires/lazarus-mcp)
-
-**What:** MCP server that can restart Claude Code during MCP updates.
-**Why:** Solves self-restart deadlocks when an MCP updates itself.
-
-### [ratatui-interact](https://github.com/Brainwires/ratatui-interact)
-
-**What:** Interactive TUI primitives for Ratatui.
-**Why:** Powers the Brainwires CLI/TUI UX with reusable components.
-
-### [react-skia-pack](https://github.com/Brainwires/react-skia-pack)
-
-**What:** GPU-accelerated React components built on Skia/CanvasKit.
-**Why:** High-performance data visualization for web UIs.
-
-### [selfhosted-supabase-mcp](https://github.com/Brainwires/selfhosted-supabase-mcp)
-
-**What:** MCP server for self-hosted Supabase deployments.
-**Why:** Bridges agent tooling with our internal Supabase stacks.
-
-### [supabase-postgres-spock](https://github.com/Brainwires/supabase-postgres-spock)
-
-**What:** Supabase Postgres fork with Spock multi-master replication support.
-**Why:** Used for pgEdge deployments (Spock = multi-master replication).
-
-### [supabase-cli](https://github.com/Brainwires/supabase-cli) 
-
-**What:** Supabase CLI fork (migrations, local dev, edge functions, backups).
-**Why:** Maintained to support pgEdge/Spock workflows and custom patches.
-
-### [supabase-supabase](https://github.com/Brainwires/supabase-supabase)
-
-**What:** Supabase platform repo (dashboard, infra, tooling).
-**Why:** Source-of-truth fork for pgEdge-specific integration work.
-
-### [next-pwa](https://github.com/Brainwires/next-pwa)
-
-**What:** Next.js PWA plugin fork.
-**Why:** Maintains compatibility fixes and build tweaks for our web app.
+A library of high-performance, GPU-accelerated React components built on Google's Skia graphics engine via CanvasKit — for data visualization, interactive widgets, and custom graphics.
 
 ---
 
 ## Philosophy
 
-- **Performance First** — All core projects are written in Rust for maximum speed and safety
-- **AI-Native** — Built for seamless integration with AI assistants via MCP
-- **Full-Stack Ownership** — We build the browser, the compute engine, the CLI, and the web app
+- **Performance First** — core projects are written in Rust for speed and safety
+- **AI-Native** — built for seamless integration with AI assistants via MCP
+- **Client-Side** — WebAssembly + WebGPU keep compute on your machine, not a server
 
 ---
 
 ## Connect
 
-- **Website:** [brainwires.studio](https://brainwires.studio)
+- **Website:** [brainwires.net](https://brainwires.net)
 - **YouTube:** [@BrainwiresCortex](https://youtube.com/@BrainwiresCortex)
 - **Business Inquiries:** support@brainwires.net
 
