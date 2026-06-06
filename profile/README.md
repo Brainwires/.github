@@ -45,7 +45,7 @@ Loads the same GGUF blobs Ollama already has on disk and runs the forward pass o
 - **AI-first** — persistent AI Memory Heap that survives context compression, 17+ MCP tools, Chrome DevTools Protocol
 - **Single binary** — no dependencies, deploy anywhere; passes Google's anti-bot protection
 
-[`crates.io/crates/thalora`](https://crates.io/crates/thalora) · [`docs.rs/thalora`](https://docs.rs/thalora) · 658 tests passing
+[`crates.io/crates/thalora`](https://crates.io/crates/thalora) · [`docs.rs/thalora`](https://docs.rs/thalora) · [thalora.dev](https://thalora.dev) · 658 tests passing
 
 ---
 
