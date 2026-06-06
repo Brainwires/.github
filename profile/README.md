@@ -20,6 +20,8 @@ Loads the same GGUF blobs Ollama already has on disk and runs the forward pass o
 - In-browser LoRA fine-tuning — backward kernels, Adam over GPU buffers, adapters export as safetensors
 - Streaming load via HTTP byte-range or OPFS sync handles — the 7 GB GGUF never enters wasm linear memory in bulk
 
+[rullama.com](https://rullama.com)
+
 ### [Brainwires Framework](https://github.com/Brainwires/brainwires-framework) ![globe](globe.svg)
 
 **A modular Rust framework for building complete AI solutions.** A workspace of 32 framework crates (plus extras), each independently publishable to crates.io and composable through the `brainwires` facade crate. A subset is ported to Deno.
