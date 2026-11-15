@@ -39,7 +39,10 @@ Inputs (environment; the action maps its inputs onto these):
   GITHUB_RUN_ATTEMPT, GITHUB_API_URL, GITHUB_EVENT_NAME, GITHUB_EVENT_PATH.
 
 Output (stdout, `$GITHUB_OUTPUT` lines): `plan=<JSON>`, `hosted=<JSON list of
-the keys on GitHub>`, `free=<JSON {label: free slots before this run}>`. A
+the keys on GitHub>`, `free=<JSON {label: free slots before this run}>`,
+`blocked=<JSON list of the labels that take no job at all: unhealthy, paused,
+unlisted or stalled in the previous attempt>` (a planner must never make a job
+wait on one of those, macOS cap or not). A
 decision table goes to stderr (and the step summary, through the action).
 
 This never fails a run: any error sends every job but the pinned ones to its
@@ -370,7 +373,9 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
         ):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
-        elif p.macos and hosted_macos >= macos_cap:
+        elif p.macos and hosted_macos >= macos_cap and not (notes or {}).get(p.label):
+            # GitHub's macOS share is spent: wait for our pool, but only for a pool that is
+            # merely busy (never one that is unhealthy, paused, unlisted or stalled).
             plan[key], rows[key] = p.runs_on, (
                 p.name,
                 "ours (waits)",
@@ -520,8 +525,12 @@ def is_fork_pr(env):
     return head != env.get("GITHUB_REPOSITORY")
 
 
+LAST = {"blocked": []}  # side output of the latest pick() (kept out of its return value)
+
+
 def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None):
     """(plan, rows, free) for the environment `env` (see the module docstring)."""
+    LAST["blocked"] = []
     now = time.time() if now is None else now
     jobs, bad = parse_jobs(env.get("PICK_JOBS"))
     for entry in bad:
@@ -583,6 +592,7 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None):
         free, groups = free_slots(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes)
+        LAST["blocked"] = sorted(l for l, n in notes.items() if n)
         return plan, rows, free
     except Exception as e:  # never fail the run
         warn(f"pick-runners: {e}; every job but the pinned ones takes its GitHub image")
@@ -620,6 +630,7 @@ def main(argv):
     print(f"plan={_dumps(plan)}")
     print(f"hosted={_dumps(hosted)}")
     print(f"free={_dumps(free)}")
+    print(f"blocked={_dumps(LAST['blocked'])}")
     print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free), file=sys.stderr)
     summary = env.get("GITHUB_STEP_SUMMARY")
     if summary and not dry:
