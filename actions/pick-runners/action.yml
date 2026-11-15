@@ -24,6 +24,9 @@ inputs:
   macos-cap:
     description: "The most macOS jobs this run sends to GitHub (GitHub runs ~5 for the whole org)."
     default: "3"
+  settle:
+    description: "Most seconds to wait for an earlier run of this repository (created up to 2 min before) to finish picking, so its jobs count (0: off)."
+    default: "90"
   dry-run:
     description: "`true`: print the decisions, make no API call."
     default: "false"
@@ -50,6 +53,7 @@ runs:
         PICK_VARS: ${{ inputs.vars }}
         PICK_MACOS_CAP: ${{ inputs.macos-cap }}
         PICK_DRY_RUN: ${{ inputs.dry-run }}
+        PICK_SETTLE: ${{ inputs.settle }}
         PICK_RUNNER_TOKEN: ${{ inputs.runner-token }}
         GITHUB_TOKEN: ${{ inputs.token }}
       # The script never fails and prints its own fallback; if python itself cannot start, the
