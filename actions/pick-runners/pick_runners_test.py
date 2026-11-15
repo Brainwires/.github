@@ -415,8 +415,38 @@ class SettleTest(unittest.TestCase):
         self.on_sleep = picked
         plan, warnings = self.go()
         self.assertEqual(plan["d"], "macos-15-intel")  # the slot is the sibling's
-        self.assertEqual(self.sleeps, [5, 5])
+        self.assertEqual(sum(self.sleeps), 20)  # 5 s picking, then 15 s quiet
         self.assertTrue(any("waited" in w for w in warnings))
+
+    def test_the_runtime_run_between_its_two_pickers(self):
+        # Gap 1: the fork runtime run's `pick runners` is done, `guard` runs (setup is not
+        # listed yet: the API lists a job once its needs are done), then `setup: pick matrix
+        # runners` picks and its matrix job queues on mac-x64. The quiet period bridges guard.
+        self.setup([{"name": "pick runners", "status": "completed", "labels": ["ubuntu-latest"]},
+                    {"name": "guard", "status": "in_progress", "labels": ["ubuntu-24.04"]}])
+        step = {"n": 0}
+
+        def progress():
+            step["n"] += 1
+            jobs = self.api.jobs["99"]
+            if step["n"] == 2:  # 10 s in: guard done, setup picking
+                jobs[1]["status"] = "completed"
+                jobs.append({"name": "setup: pick matrix runners", "status": "in_progress",
+                             "labels": ["ubuntu-24.04"]})
+            if step["n"] == 4:  # 20 s in: setup done, the planned job exists
+                jobs[2]["status"] = "completed"
+                jobs.append({"name": "denort bin / x86_64-apple-darwin", "status": "queued",
+                             "labels": ["self-hosted", "denext-macos-x64"]})
+        self.on_sleep = progress
+        plan, _ = self.go()
+        self.assertEqual(plan["d"], "macos-15-intel")
+        self.assertEqual(sum(self.sleeps), 35)  # 20 s until setup ends, then 15 s quiet
+
+    def test_picker_names(self):
+        for name in ("pick runners", "macos-15 / pick build runners", "setup: pick matrix runners"):
+            self.assertTrue(pr.PICKER_JOB.search(name), name)
+        for name in ("setup", "build debug", "pick runners / test", "pickle runners"):
+            self.assertFalse(pr.PICKER_JOB.search(name), name)
 
     def test_a_sibling_with_no_jobs_yet_is_waited_for(self):
         self.setup([])
@@ -428,11 +458,11 @@ class SettleTest(unittest.TestCase):
         plan, _ = self.go()
         self.assertEqual(plan["d"], "macos-15-intel")
 
-    def test_no_wait_when_the_sibling_already_picked(self):
+    def test_a_sibling_that_already_picked_costs_only_the_quiet_period(self):
         self.setup([{"name": "pick runners", "status": "completed", "labels": ["ubuntu-latest"]},
                     {"name": "build", "status": "in_progress", "labels": ["self-hosted", "denext-macos-x64"]}])
         plan, _ = self.go()
-        self.assertEqual(self.sleeps, [])
+        self.assertEqual(sum(self.sleeps), 15)
         self.assertEqual(plan["d"], "macos-15-intel")
 
     def test_a_later_run_never_makes_us_wait(self):
@@ -452,12 +482,12 @@ class SettleTest(unittest.TestCase):
         self.setup([{"name": "leg / pick runners", "status": "waiting", "labels": []},
                     {"name": "leg / build", "status": "in_progress", "labels": ["ubuntu-latest"]}])
         self.go()
-        self.assertEqual(self.sleeps, [])
+        self.assertEqual(sum(self.sleeps), 15)  # the quiet period only
 
     def test_gives_up_after_the_limit(self):
         self.setup([{"name": "pick runners", "status": "in_progress", "labels": ["ubuntu-latest"]}])
         plan, warnings = self.go(PICK_SETTLE="20")
-        self.assertEqual(sum(self.sleeps), 25)  # 4 looks x 5 s, then 5 s for the jobs
+        self.assertEqual(sum(self.sleeps), 20)  # 4 looks x 5 s, then the limit
         self.assertTrue(any("still picking after 20s" in w for w in warnings))
         self.assertEqual(plan["d"], ["self-hosted", "denext-macos-x64"])
 

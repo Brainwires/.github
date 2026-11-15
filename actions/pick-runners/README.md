@@ -43,8 +43,10 @@ its GitHub image.
 - Same-second siblings: workflows dispatched together (a release gate, a fork train's tests and
   runtime runs) would each count the pools before the other has queued its jobs. A run waits
   (polling every 5 s, at most `settle`, default 90 s) while an EARLIER run of the same repository,
-  created up to 2 min before it, is still starting or still has a `pick … runners` job queued or
-  running; then 5 s more, and it counts. The later run always yields, so two pickers never wait
+  created up to 2 min before it, is still starting or still has a picker job queued or running
+  (`pick … runners`, `<leg> / pick … runners`, or `<job>: pick … runners` for a job that also
+  picks); it counts only after 15 s with no sibling picking (which bridges a sibling between two
+  pickers: the jobs API lists a job only once its `needs` are done). The later run always yields, so two pickers never wait
   for each other. Across repositories the fleet's `queued` count (published every ~1-5 min) is
   the only signal.
 - Fork pull requests (and any `pull_request_*` but `pull_request` itself): GitHub images only,
