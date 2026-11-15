@@ -51,7 +51,9 @@ its GitHub image.
   with overflow.
 
 Pools: `linux-x64`, `linux-x64-2204`, `linux-x64-docker` (biscuits, shared capacity),
-`windows-x64`, `windows-arm64`, `macos-arm64`, `macos-x64`, `linux-arm64-desktop` (the Pi; pinned
+`windows-x64`, `windows-x64-fast` (long jobs: only the fast Windows host, label
+`denext-windows-x64-fast`; it shares `windows-x64`'s slots, and when that host is busy the job
+goes to GitHub, never to the slow host), `windows-arm64`, `macos-arm64`, `macos-x64`, `linux-arm64-desktop` (the Pi; pinned
 jobs only). See `pick_runners.py` for the full rules; tests: `python3 -I pick_runners_test.py`.
 
 Dry run (no API call), e.g. against the live value:

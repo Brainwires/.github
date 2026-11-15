@@ -65,6 +65,11 @@ POOLS = {
     "linux-x64-2204": ("RUNNER_LINUX_X64_2204", "denext-linux-x64-2204", "ubuntu-22.04", "biscuits", False),
     "linux-x64-docker": ("RUNNER_LINUX_X64_DOCKER", "denext-linux-x64-docker", "ubuntu-latest", "biscuits", False),
     "windows-x64": ("RUNNER_WINDOWS_X64", "denext-windows-x64", "windows-latest", None, False),
+    # The FAST Windows x64 host only (win-x64, the MacBook VM): for long jobs. The label is an
+    # extra label win-x64's runners carry beside denext-windows-x64; brain (win-x64-brain, an
+    # i3 2C/4T) serves only the shared label and runs a 65-72 min job in 80-95 min. Switched by
+    # RUNNER_WINDOWS_X64; its slot is one of windows-x64's (SUBPOOL_OF).
+    "windows-x64-fast": ("RUNNER_WINDOWS_X64", "denext-windows-x64-fast", "windows-latest", None, False),
     "windows-arm64": ("RUNNER_WINDOWS_ARM", "denext-windows-arm64", "windows-11-arm", None, False),
     "macos-arm64": ("RUNNER_MACOS_ARM", "denext-macos-arm64", "macos-latest", None, True),
     "macos-x64": ("RUNNER_MACOS_X64", "denext-macos-x64", "macos-15-intel", None, True),
@@ -75,6 +80,10 @@ POOLS = {
 # A pool whose variable is empty falls back to another pool's variable (the
 # docker pool to RUNNER_LINUX_X64, as the workflows did before).
 VAR_FALLBACK = {"linux-x64-docker": "RUNNER_LINUX_X64"}
+
+# A pool whose runners are some of another pool's: its label is extra on those runners, so a
+# slot it takes is also one of the other's (and vice versa through the fleet's busy count).
+SUBPOOL_OF = {"windows-x64-fast": "windows-x64"}
 
 # A shared group's capacity variable (biscuits' three labels are one 8-core
 # host's job containers).
@@ -130,6 +139,13 @@ class Pool:
         self.name = name
         self.mode, self.runs_on, var_label = parse_variable(raw)
         self.label = var_label or label
+        self.parent_label = None
+        if name in SUBPOOL_OF:
+            # the variable is only the switch: the runs-on is always the fixed sub-label
+            self.parent_label = Pool(SUBPOOL_OF[name], variables).label
+            self.label = label
+            if self.mode == "ours":
+                self.runs_on = ["self-hosted", label]
         self.image = image
         self.group = group
         self.macos = macos
@@ -316,6 +332,11 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
 
     def take(p):
         free[p.label] = free.get(p.label, 0) - 1
+        if p.parent_label in free:
+            free[p.parent_label] -= 1
+        for other in pools.values():  # a sub-pool's slots are its parent's
+            if other.parent_label == p.label and other.label in free:
+                free[other.label] = min(free[other.label], free[p.label])
         if p.group:
             groups[p.group] = groups.get(p.group, 0) - 1
 
@@ -344,7 +365,9 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
         elif p.mode == "image":
             # the job's own @image wins (a leg keeps the image its build ran on)
             plan[key], rows[key] = job["image"] or p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
-        elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) > 0):
+        elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) > 0) and (
+            p.parent_label not in free or free[p.parent_label] > 0
+        ):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
         elif p.macos and hosted_macos >= macos_cap:

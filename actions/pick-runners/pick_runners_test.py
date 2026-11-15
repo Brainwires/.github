@@ -258,6 +258,44 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(plan["a"], "windows-2025")
 
 
+class FastHostTest(unittest.TestCase):
+    """Long Windows jobs ask for the fast host's own label; brain never takes them."""
+
+    def h(self, win_busy, fast_busy, brain_ok=True):
+        return health({"denext-windows-x64": entry(2, busy=win_busy + (1 if brain_ok and win_busy > fast_busy else 0),
+                                                   healthy=2 if brain_ok else 1),
+                       "denext-windows-x64-fast": entry(1, busy=fast_busy)})
+
+    def test_long_job_on_fast_host_when_free(self):
+        plan, _, _, _ = run(env("t=windows-x64-fast", self.h(0, 0), RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan["t"], ["self-hosted", "denext-windows-x64-fast"])
+
+    def test_long_job_overflows_when_only_brain_is_free(self):
+        h = health({"denext-windows-x64": entry(2, busy=1), "denext-windows-x64-fast": entry(1, busy=1)})
+        plan, rows, _, _ = run(env("t=windows-x64-fast s=windows-x64", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"t": "windows-latest", "s": ours(WIN)})  # the short job takes brain
+
+    def test_long_job_uses_up_the_shared_label_slot(self):
+        h = health({"denext-windows-x64": entry(2, busy=1), "denext-windows-x64-fast": entry(1, busy=0)})
+        plan, _, _, _ = run(env("t=windows-x64-fast s=windows-x64", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"t": ["self-hosted", "denext-windows-x64-fast"], "s": "windows-latest"})
+
+    def test_short_job_first_leaves_no_fast_slot(self):
+        h = health({"denext-windows-x64": entry(2, busy=1), "denext-windows-x64-fast": entry(1, busy=0)})
+        plan, _, _, _ = run(env("s=windows-x64 t=windows-x64-fast", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"s": ours(WIN), "t": "windows-latest"})
+
+    def test_fast_label_not_published_yet(self):
+        plan, rows, _, _ = run(env("t=windows-x64-fast", health({"denext-windows-x64": entry(2)}),
+                                   RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan["t"], "windows-latest")
+        self.assertIn("does not list denext-windows-x64-fast", rows[0][3])
+
+    def test_switched_by_the_windows_variable(self):
+        plan, _, _, _ = run(env("t=windows-x64-fast@windows-2022", self.h(0, 0), RUNNER_WINDOWS_X64="windows-latest"))
+        self.assertEqual(plan["t"], "windows-2022")
+
+
 class MacosCapTest(unittest.TestCase):
     def test_cap_sends_the_rest_to_our_pool(self):
         h = health({"denext-macos-arm64": entry(2, busy=2)})
