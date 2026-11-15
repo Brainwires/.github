@@ -47,7 +47,7 @@ its GitHub image.
 - Re-runs: a pool whose job the previous attempt cancelled before any runner took it gets 0 free;
   a GitHub macOS job that went the same way sets the macOS cap to 0.
 - The pool variables (`RUNNER_WINDOWS_X64`, …): unset → the GitHub image; a GitHub image
-  (`windows-latest`) → that image; our label (`["self-hosted","denext-windows-x64"]`) → our pool
+  (`windows-latest`) → that image (a job's own `@image` wins); our label (`["self-hosted","denext-windows-x64"]`) → our pool
   with overflow.
 
 Pools: `linux-x64`, `linux-x64-2204`, `linux-x64-docker` (biscuits, shared capacity),

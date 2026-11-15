@@ -342,7 +342,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
         elif p.mode == "off":
             plan[key], rows[key] = image, (p.name, "GitHub", f"{POOLS[p.name][0]} is unset")
         elif p.mode == "image":
-            plan[key], rows[key] = p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
+            # the job's own @image wins (a leg keeps the image its build ran on)
+            plan[key], rows[key] = job["image"] or p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
         elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) > 0):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")

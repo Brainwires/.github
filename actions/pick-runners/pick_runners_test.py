@@ -316,6 +316,11 @@ class VariableTest(unittest.TestCase):
         self.assertEqual(plan["a"], "windows-latest")
         self.assertIn("names a GitHub image", rows[0][3])
 
+    def test_variable_naming_an_image_keeps_the_jobs_own_image(self):
+        h = health({"denext-windows-x64": entry(2)})
+        plan, _, _, _ = run(env("a=windows-x64@windows-2022", h, RUNNER_WINDOWS_X64="windows-latest"))
+        self.assertEqual(plan["a"], "windows-2022")
+
     def test_unset_variable(self):
         plan, _, _, _ = run(env("a=linux-x64-2204", health({})))
         self.assertEqual(plan["a"], "ubuntu-22.04")
