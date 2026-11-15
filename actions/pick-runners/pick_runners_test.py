@@ -375,6 +375,105 @@ class RerunTest(unittest.TestCase):
         self.assertFalse(any("/attempts/" in c for c in api.calls))
 
 
+class SettleTest(unittest.TestCase):
+    """The same-second race (Brainwires/deno runs 43774199406 tests / 43774202217 runtime)."""
+
+    T0 = "2026-11-15T20:00:00Z"
+    T_PLUS = "2026-11-15T20:00:04Z"
+
+    def setup(self, sibling_jobs, sibling_created=None, sibling_id=99):
+        self.api = FakeApi(
+            runs=[{"id": sibling_id, "status": "in_progress", "created_at": sibling_created or self.T0},
+                  {"id": 100, "status": "queued", "created_at": self.T_PLUS}],
+            jobs={str(sibling_id): sibling_jobs})
+        self.clock_t = 0.0
+        self.sleeps = []
+        self.on_sleep = lambda: None
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.clock_t += s
+        self.on_sleep()
+
+    def go(self, jobs="d=macos-x64", **extra):
+        h = health({"denext-macos-x64": entry(1, busy=0)})
+        e = env(jobs, h, RUNNER_MACOS_X64=MACX)
+        e.update(extra)
+        warnings = []
+        plan, _, _ = pr.pick(e, self.api, None, warnings.append, NOW, sleep=self.sleep,
+                             clock=lambda: self.clock_t)
+        return plan, warnings
+
+    def test_waits_for_the_earlier_sibling_picker_then_counts_its_job(self):
+        picker = {"name": "macos-15-intel / pick build runners", "status": "in_progress", "labels": ["ubuntu-24.04"]}
+        self.setup([picker])
+
+        def picked():  # the tests run's picker finishes and its build job queues on mac-x64
+            picker["status"] = "completed"
+            self.api.jobs["99"].append({"name": "macos-15-intel / build debug", "status": "queued",
+                                        "labels": ["self-hosted", "denext-macos-x64"]})
+        self.on_sleep = picked
+        plan, warnings = self.go()
+        self.assertEqual(plan["d"], "macos-15-intel")  # the slot is the sibling's
+        self.assertEqual(self.sleeps, [5, 5])
+        self.assertTrue(any("waited" in w for w in warnings))
+
+    def test_a_sibling_with_no_jobs_yet_is_waited_for(self):
+        self.setup([])
+
+        def started():
+            self.api.jobs["99"] = [{"name": "pick runners", "status": "completed", "labels": ["ubuntu-latest"]},
+                                   {"name": "build", "status": "queued", "labels": ["self-hosted", "denext-macos-x64"]}]
+        self.on_sleep = started
+        plan, _ = self.go()
+        self.assertEqual(plan["d"], "macos-15-intel")
+
+    def test_no_wait_when_the_sibling_already_picked(self):
+        self.setup([{"name": "pick runners", "status": "completed", "labels": ["ubuntu-latest"]},
+                    {"name": "build", "status": "in_progress", "labels": ["self-hosted", "denext-macos-x64"]}])
+        plan, _ = self.go()
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(plan["d"], "macos-15-intel")
+
+    def test_a_later_run_never_makes_us_wait(self):
+        # the sibling has the HIGHER id: it yields to us (no mutual waiting)
+        self.setup([{"name": "pick runners", "status": "in_progress", "labels": ["ubuntu-latest"]}], sibling_id=101)
+        plan, _ = self.go()
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(plan["d"], ["self-hosted", "denext-macos-x64"])
+
+    def test_an_old_run_is_not_a_sibling(self):
+        self.setup([{"name": "pick runners", "status": "in_progress", "labels": ["ubuntu-latest"]}],
+                   sibling_created="2026-11-15T19:50:00Z")
+        self.go()
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_picker_blocked_on_its_needs_is_not_waited_for(self):
+        self.setup([{"name": "leg / pick runners", "status": "waiting", "labels": []},
+                    {"name": "leg / build", "status": "in_progress", "labels": ["ubuntu-latest"]}])
+        self.go()
+        self.assertEqual(self.sleeps, [])
+
+    def test_gives_up_after_the_limit(self):
+        self.setup([{"name": "pick runners", "status": "in_progress", "labels": ["ubuntu-latest"]}])
+        plan, warnings = self.go(PICK_SETTLE="20")
+        self.assertEqual(sum(self.sleeps), 25)  # 4 looks x 5 s, then 5 s for the jobs
+        self.assertTrue(any("still picking after 20s" in w for w in warnings))
+        self.assertEqual(plan["d"], ["self-hosted", "denext-macos-x64"])
+
+    def test_settle_off(self):
+        self.setup([{"name": "pick runners", "status": "in_progress", "labels": ["ubuntu-latest"]}])
+        self.go(PICK_SETTLE="0")
+        self.assertEqual(self.sleeps, [])
+
+    def test_no_api_no_settle(self):
+        h = health({"denext-macos-x64": entry(1)})
+        slept = []
+        pr.pick(env("d=macos-x64", h, RUNNER_MACOS_X64=MACX), None, None, lambda m: None, NOW,
+                sleep=slept.append, clock=lambda: 0)
+        self.assertEqual(slept, [])
+
+
 class VariableTest(unittest.TestCase):
     def test_variable_naming_an_image_sends_jobs_there(self):
         # The coordinator's temporary RUNNER_WINDOWS_X64=windows-latest.

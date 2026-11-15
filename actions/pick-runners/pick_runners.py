@@ -34,6 +34,8 @@ Inputs (environment; the action maps its inputs onto these):
 - PICK_RUNNER_TOKEN (optional): a token that may list the org's self-hosted
   runners (RUNNER_STATUS_TOKEN). With it the running jobs are counted org-wide
   in one call.
+- PICK_SETTLE (optional): the most seconds to wait for earlier sibling runs'
+  pickers (default 90; 0 turns it off). See `settle`.
 - PICK_DRY_RUN: `true` prints the decisions and makes no API call.
 - GITHUB_TOKEN (`actions: read`), GITHUB_REPOSITORY, GITHUB_RUN_ID,
   GITHUB_RUN_ATTEMPT, GITHUB_API_URL, GITHUB_EVENT_NAME, GITHUB_EVENT_PATH.
@@ -49,6 +51,7 @@ This never fails a run: any error sends every job but the pinned ones to its
 image (toward speed), with a warning.
 """
 
+import calendar
 import json
 import os
 import re
@@ -447,6 +450,78 @@ def list_all(get, path, key):
     return items
 
 
+SETTLE_MAX = 90  # seconds, at most (PICK_SETTLE)
+SETTLE_WINDOW = 120  # seconds: an earlier run created this long before ours is a sibling
+SETTLE_STEP = 5  # seconds between looks, and after the last wait
+PICKER_JOB = re.compile(r"(^| / )pick [^/]*runners?$")
+
+
+def _epoch(stamp):
+    try:
+        return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+
+def settle(get, repo, run_id, sleep, clock, max_wait=SETTLE_MAX, warn=lambda m: None):
+    """Wait for this repository's EARLIER sibling runs to finish picking, so their
+    picked jobs exist (and are counted) before this run decides. Returns the
+    seconds waited.
+
+    The same-second race (Brainwires/deno run 43774202217): two workflows
+    dispatched seconds apart both count the pools before either has queued its
+    jobs, and both send a job to the same single slot. A sibling is an in-flight
+    run of this repository created at most SETTLE_WINDOW seconds before this one,
+    with a LOWER run id (so two pickers never wait for each other: the later run
+    yields). While a sibling has no jobs yet (still starting) or has a picker job
+    (`pick … runners`, `<leg> / pick … runners`) queued or running, look again
+    every SETTLE_STEP seconds, for at most `max_wait`; after any wait, one more
+    SETTLE_STEP for its picked jobs to be created. A picker job still blocked on
+    its `needs` (waiting) is not waited for: it picks much later, from the
+    fleet's numbers. Costs 2 calls plus one per sibling per look, only when a
+    sibling exists."""
+    if max_wait <= 0:
+        return 0
+    start = clock()
+    waited = False
+    while True:
+        runs, seen = [], set()
+        for status in ("queued", "in_progress"):
+            for r in list_all(get, f"/repos/{repo}/actions/runs?status={status}", "workflow_runs"):
+                if str(r.get("id")) not in seen:
+                    seen.add(str(r.get("id")))
+                    runs.append(r)
+        me = next((r for r in runs if str(r.get("id")) == str(run_id)), None)
+        mine = _epoch(me.get("created_at")) if me else None
+        if mine is None:
+            break
+        pending = []
+        for r in runs:
+            try:
+                earlier = int(r.get("id")) < int(run_id)
+            except (TypeError, ValueError):
+                continue
+            created = _epoch(r.get("created_at"))
+            if not earlier or created is None or not 0 <= mine - created <= SETTLE_WINDOW:
+                continue
+            jobs = list_all(get, f"/repos/{repo}/actions/runs/{r['id']}/jobs?filter=latest", "jobs")
+            if not jobs or any(
+                PICKER_JOB.search(j.get("name") or "") and j.get("status") in ("queued", "in_progress")
+                for j in jobs
+            ):
+                pending.append(str(r["id"]))
+        if not pending:
+            break
+        if clock() - start >= max_wait:
+            warn(f"pick-runners: earlier run(s) {', '.join(pending)} still picking after {max_wait}s; deciding anyway")
+            break
+        sleep(SETTLE_STEP)
+        waited = True
+    if waited:
+        sleep(SETTLE_STEP)
+    return round(clock() - start)
+
+
 def count_jobs(get, repo, run_id, labels):
     """(running, queued) per label of `labels`: the active jobs of this
     repository's other queued / in-progress runs (this run's jobs wait on the
@@ -528,7 +603,8 @@ def is_fork_pr(env):
 LAST = {"blocked": []}  # side output of the latest pick() (kept out of its return value)
 
 
-def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None):
+def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=time.sleep,
+         clock=time.monotonic):
     """(plan, rows, free) for the environment `env` (see the module docstring)."""
     LAST["blocked"] = []
     now = time.time() if now is None else now
@@ -579,6 +655,16 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None):
                     macos_cap = 0
             except Exception as e:  # advisory
                 warn(f"pick-runners: previous-attempt check failed ({e}); ignored")
+            try:
+                limit = int(env.get("PICK_SETTLE") or SETTLE_MAX)
+            except ValueError:
+                limit = SETTLE_MAX
+            try:
+                waited = settle(get, repo, run_id, sleep, clock, limit, warn)
+                if waited:
+                    warn(f"pick-runners: waited {waited}s for an earlier run of this repository to pick first")
+            except Exception as e:  # advisory: count now
+                warn(f"pick-runners: the sibling check failed ({e}); counting now")
             try:
                 running, queued = count_jobs(get, repo, run_id, labels)
                 counts = Counts(running, queued)
