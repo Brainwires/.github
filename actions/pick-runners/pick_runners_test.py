@@ -320,6 +320,35 @@ class MacosCapTest(unittest.TestCase):
         plan, _, _, _ = run(e)
         self.assertEqual(plan, {"a": "macos-latest", "b": "macos-latest"})
 
+    def test_cap_never_waits_on_a_stalled_pool(self):
+        # denext.24 run 43756144777 attempt 2: mac-x64 stalled in attempt 1, cap spent.
+        h = health({"denext-macos-x64": entry(1, busy=1)})
+        e = env("a=macos-x64 b=macos-x64", h, RUNNER_MACOS_X64=MACX)
+        e.update(PICK_MACOS_CAP="0", GITHUB_RUN_ATTEMPT="2")
+        api = FakeApi(attempt_jobs=[{"conclusion": "cancelled", "runner_name": None,
+                                     "labels": ["self-hosted", "denext-macos-x64"]}])
+        plan, _, _, _ = run(e, get=api)
+        self.assertEqual(plan, {"a": "macos-15-intel", "b": "macos-15-intel"})
+
+    def test_cap_never_waits_on_an_unhealthy_pool(self):
+        h = health({"denext-macos-x64": entry(1, ok=False)})
+        e = env("a=macos-x64", h, RUNNER_MACOS_X64=MACX)
+        e["PICK_MACOS_CAP"] = "0"
+        self.assertEqual(run(e)[0]["a"], "macos-15-intel")
+
+    def test_busy_single_slot_pool_with_queued_jobs_from_another_run(self):
+        # The coordinator's repro: mac-x64 busy 1/1, the tests run's jobs queued on it, two x86
+        # jobs and the arm legs on images (RUNNER_MACOS_ARM=macos-latest): both x86 go to GitHub.
+        h = health({"denext-macos-x64": entry(1, busy=1)})
+        api = FakeApi(runs=[{"id": 7, "status": "in_progress"}],
+                      jobs={"7": [{"status": "queued", "labels": ["self-hosted", "denext-macos-x64"]},
+                                  {"status": "in_progress", "labels": ["self-hosted", "denext-macos-x64"]}]})
+        e = env("a1=macos-arm64 a2=macos-arm64 a3=macos-arm64 x1=macos-x64 x2=macos-x64", h,
+                RUNNER_MACOS_ARM="macos-latest", RUNNER_MACOS_X64=MACX)
+        plan, _, free, _ = run(e, get=api)
+        self.assertEqual(free["denext-macos-x64"], 0)
+        self.assertEqual([plan["x1"], plan["x2"]], ["macos-15-intel", "macos-15-intel"])
+
     def test_rerun_after_github_macos_starved(self):
         h = health({"denext-macos-arm64": entry(1, busy=1)})
         e = env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC)
@@ -432,6 +461,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(lines["plan"]), {"a": ours(WIN), "b": "windows-latest"})
         self.assertEqual(json.loads(lines["hosted"]), ["b"])
         self.assertIn("DRY RUN", out.stderr)
+        self.assertEqual(json.loads(lines["blocked"]), [])
         self.assertIn("| b | windows-x64 | GitHub |", out.stderr)
 
 

@@ -37,6 +37,9 @@ outputs:
   free:
     description: '{label: free slots} before this run, as JSON (for a planner that allocates itself).'
     value: ${{ steps.pick.outputs.free }}
+  blocked:
+    description: "Labels that take no job at all (unhealthy, paused, unlisted, stalled), as a JSON array."
+    value: ${{ steps.pick.outputs.blocked }}
 runs:
   using: composite
   steps:
