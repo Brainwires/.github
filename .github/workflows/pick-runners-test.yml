@@ -1,0 +1,49 @@
+name: pick-runners tests
+on:
+  push:
+    paths: ["actions/pick-runners/**", ".github/workflows/pick-runners-test.yml"]
+  pull_request:
+    paths: ["actions/pick-runners/**", ".github/workflows/pick-runners-test.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    # GitHub-hosted on purpose: the picker must never depend on the pools it routes around.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      # The runner loads action.yml with a YAML parser; a malformed manifest fails every caller's
+      # picker job at "Set up job" (their jobs then fall back to GitHub images).
+      - name: action.yml parses
+        run: ruby -ryaml -e 'd = YAML.load_file("actions/pick-runners/action.yml"); abort "not composite" unless d["runs"]["using"] == "composite"'
+      - run: python3 -I actions/pick-runners/pick_runners_test.py
+
+  # The action itself, end to end on a real runner: the live org variables, real API calls on this
+  # repository, the plan printed. Every pool appears once; nothing runs on the picks.
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - id: pick
+        uses: ./actions/pick-runners
+        with:
+          jobs: >-
+            lin=linux-x64 lin2=linux-x64 l2204=linux-x64-2204 dock=linux-x64-docker
+            win=windows-x64 winfast=windows-x64-fast winarm=windows-arm64
+            mac=macos-arm64 macx=macos-x64 pi=linux-arm64-desktop! follow=~lin
+          vars: ${{ toJSON(vars) }}
+      - name: The plan is JSON with every key
+        env:
+          PLAN: ${{ steps.pick.outputs.plan }}
+        run: |
+          echo "$PLAN" | python3 -I -c 'import json,sys; p=json.load(sys.stdin); want={"lin","lin2","l2204","dock","win","winfast","winarm","mac","macx","pi","follow"}; missing=want-set(p); print(p); sys.exit(f"missing {missing}" if missing else 0)'
