@@ -1,0 +1,18 @@
+name: pick-runners tests
+on:
+  push:
+    paths: ["actions/pick-runners/**", ".github/workflows/pick-runners-test.yml"]
+  pull_request:
+    paths: ["actions/pick-runners/**", ".github/workflows/pick-runners-test.yml"]
+permissions:
+  contents: read
+jobs:
+  test:
+    # GitHub-hosted on purpose: the picker must never depend on the pools it routes around.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - run: python3 -I actions/pick-runners/pick_runners_test.py

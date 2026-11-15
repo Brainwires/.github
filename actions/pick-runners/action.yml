@@ -1,0 +1,55 @@
+name: Pick runners
+description: >-
+  Our self-hosted pools first, GitHub-hosted for the overflow: each job of the run goes to our pool
+  only while it has a free slot (from the fleet's DENEXT_POOL_HEALTH and the queued jobs), else to
+  the GitHub image at once. See pick_runners.py for the rules.
+inputs:
+  jobs:
+    description: >-
+      The jobs in priority order, whitespace separated: `key=pool`, `key=pool@image`, `key=pool!`
+      (pinned to our hardware) or `key=~other` (same runner as `other`). Pools: linux-x64,
+      linux-x64-2204, linux-x64-docker, windows-x64, windows-arm64, macos-arm64, macos-x64,
+      linux-arm64-desktop.
+    required: true
+  vars:
+    description: The workflow's `toJSON(vars)` (the RUNNER_* pool variables and DENEXT_POOL_HEALTH).
+    required: true
+  token:
+    description: A token with `actions: read` on this repository (its queued and running jobs).
+    default: ${{ github.token }}
+  runner-token:
+    description: Optional token that may list the org's self-hosted runners (RUNNER_STATUS_TOKEN).
+    default: ""
+  macos-cap:
+    description: The most macOS jobs this run sends to GitHub (GitHub runs ~5 for the whole org).
+    default: "3"
+  dry-run:
+    description: "`true`: print the decisions, make no API call."
+    default: "false"
+outputs:
+  plan:
+    description: '{key: runs-on} as JSON; a job reads `fromJSON(needs.<picker>.outputs.plan).<key>`.'
+    value: ${{ steps.pick.outputs.plan }}
+  hosted:
+    description: The keys on GitHub's images, as a JSON array.
+    value: ${{ steps.pick.outputs.hosted }}
+  free:
+    description: '{label: free slots} before this run, as JSON (for a planner that allocates itself).'
+    value: ${{ steps.pick.outputs.free }}
+runs:
+  using: composite
+  steps:
+    - id: pick
+      shell: bash
+      env:
+        PICK_JOBS: ${{ inputs.jobs }}
+        PICK_VARS: ${{ inputs.vars }}
+        PICK_MACOS_CAP: ${{ inputs.macos-cap }}
+        PICK_DRY_RUN: ${{ inputs.dry-run }}
+        PICK_RUNNER_TOKEN: ${{ inputs.runner-token }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+      # The script never fails and prints its own fallback; if python itself cannot start, the
+      # outputs stay empty and each job's `|| '<image>'` fallback takes GitHub's image.
+      run: |
+        python3 -I "$GITHUB_ACTION_PATH/pick_runners.py" >>"$GITHUB_OUTPUT" ||
+          echo "::warning::pick-runners failed to run: every job takes its fallback image"
