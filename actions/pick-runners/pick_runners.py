@@ -452,8 +452,12 @@ def list_all(get, path, key):
 
 SETTLE_MAX = 90  # seconds, at most (PICK_SETTLE)
 SETTLE_WINDOW = 120  # seconds: an earlier run created this long before ours is a sibling
-SETTLE_STEP = 5  # seconds between looks, and after the last wait
-PICKER_JOB = re.compile(r"(^| / )pick [^/]*runners?$")
+SETTLE_STEP = 5  # seconds between looks
+SETTLE_QUIET = 15  # seconds with no sibling picking before this run counts
+# A picker job: `pick … runners`, `<leg> / pick … runners` (a reusable workflow's), or
+# `<job>: pick … runners` (a job that also picks, such as the fork runtime run's
+# `setup: pick matrix runners`, whose step hands the action's free slots to plan_matrix).
+PICKER_JOB = re.compile(r"(^| / |: )pick [^/]*runners?$")
 
 
 def _epoch(stamp):
@@ -474,16 +478,20 @@ def settle(get, repo, run_id, sleep, clock, max_wait=SETTLE_MAX, warn=lambda m: 
     run of this repository created at most SETTLE_WINDOW seconds before this one,
     with a LOWER run id (so two pickers never wait for each other: the later run
     yields). While a sibling has no jobs yet (still starting) or has a picker job
-    (`pick … runners`, `<leg> / pick … runners`) queued or running, look again
-    every SETTLE_STEP seconds, for at most `max_wait`; after any wait, one more
-    SETTLE_STEP for its picked jobs to be created. A picker job still blocked on
-    its `needs` (waiting) is not waited for: it picks much later, from the
-    fleet's numbers. Costs 2 calls plus one per sibling per look, only when a
-    sibling exists."""
+    (PICKER_JOB) queued or running, look again every SETTLE_STEP seconds; count
+    only after SETTLE_QUIET seconds in which no sibling was picking, for at most
+    `max_wait` in all. The quiet period covers a sibling between two pickers
+    (the fork runtime run: `pick runners`, then `guard`, about 7 s, then `setup:
+    pick matrix runners`, whose picked jobs exist the moment it ends): the jobs
+    API lists a job only once its `needs` are done, so the next picker cannot be
+    seen before it starts. A picker much further down a sibling's graph (a test
+    leg's, after an hour-long build) picks from the numbers of its own time.
+    Costs 2 calls plus one per sibling per look, only when a sibling exists."""
     if max_wait <= 0:
         return 0
     start = clock()
-    waited = False
+    quiet_since = None  # when the siblings were last seen not picking
+    any_sibling = False
     while True:
         runs, seen = [], set()
         for status in ("queued", "in_progress"):
@@ -504,20 +512,25 @@ def settle(get, repo, run_id, sleep, clock, max_wait=SETTLE_MAX, warn=lambda m: 
             created = _epoch(r.get("created_at"))
             if not earlier or created is None or not 0 <= mine - created <= SETTLE_WINDOW:
                 continue
+            any_sibling = True
             jobs = list_all(get, f"/repos/{repo}/actions/runs/{r['id']}/jobs?filter=latest", "jobs")
             if not jobs or any(
                 PICKER_JOB.search(j.get("name") or "") and j.get("status") in ("queued", "in_progress")
                 for j in jobs
             ):
                 pending.append(str(r["id"]))
-        if not pending:
+        if not any_sibling:
+            break
+        if pending:
+            quiet_since = None
+        elif quiet_since is None:
+            quiet_since = clock()
+        if quiet_since is not None and clock() - quiet_since >= SETTLE_QUIET:
             break
         if clock() - start >= max_wait:
-            warn(f"pick-runners: earlier run(s) {', '.join(pending)} still picking after {max_wait}s; deciding anyway")
+            if pending:
+                warn(f"pick-runners: earlier run(s) {', '.join(pending)} still picking after {max_wait}s; deciding anyway")
             break
-        sleep(SETTLE_STEP)
-        waited = True
-    if waited:
         sleep(SETTLE_STEP)
     return round(clock() - start)
 
