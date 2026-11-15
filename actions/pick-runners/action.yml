@@ -13,16 +13,16 @@ inputs:
       linux-arm64-desktop.
     required: true
   vars:
-    description: The workflow's `toJSON(vars)` (the RUNNER_* pool variables and DENEXT_POOL_HEALTH).
+    description: "The workflow's `toJSON(vars)` (the RUNNER_* pool variables and DENEXT_POOL_HEALTH)."
     required: true
   token:
-    description: A token with `actions: read` on this repository (its queued and running jobs).
+    description: "A token with `actions: read` on this repository (its queued and running jobs)."
     default: ${{ github.token }}
   runner-token:
-    description: Optional token that may list the org's self-hosted runners (RUNNER_STATUS_TOKEN).
+    description: "Optional token that may list the org's self-hosted runners (RUNNER_STATUS_TOKEN)."
     default: ""
   macos-cap:
-    description: The most macOS jobs this run sends to GitHub (GitHub runs ~5 for the whole org).
+    description: "The most macOS jobs this run sends to GitHub (GitHub runs ~5 for the whole org)."
     default: "3"
   dry-run:
     description: "`true`: print the decisions, make no API call."
@@ -32,7 +32,7 @@ outputs:
     description: '{key: runs-on} as JSON; a job reads `fromJSON(needs.<picker>.outputs.plan).<key>`.'
     value: ${{ steps.pick.outputs.plan }}
   hosted:
-    description: The keys on GitHub's images, as a JSON array.
+    description: "The keys on GitHub's images, as a JSON array."
     value: ${{ steps.pick.outputs.hosted }}
   free:
     description: '{label: free slots} before this run, as JSON (for a planner that allocates itself).'
