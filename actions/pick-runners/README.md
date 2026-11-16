@@ -13,6 +13,7 @@ jobs:
     outputs:
       plan: ${{ steps.pick.outputs.plan }}
       hosted: ${{ steps.pick.outputs.hosted }}
+      # also: free, blocked, saturated (see action.yml)
     steps:
       - id: pick
         uses: Brainwires/.github/actions/pick-runners@<full commit sha>
@@ -55,6 +56,20 @@ its GitHub image.
   the rest wait for our pool.
 - Re-runs: a pool whose job the previous attempt cancelled before any runner took it gets 0 free;
   a GitHub macOS job that went the same way sets the macOS cap to 0.
+- GitHub saturated: when the health's optional `github.<family>` (`macos`, `windows`, `ubuntu`:
+  the org's jobs queued on GitHub's images of that family, `{"queued": n, "oldest_at": epoch}`)
+  shows a job queued for at least 3 min, a job that would overflow to an image of that family
+  waits for our pool instead (`ours (waits)`), but only when the pool is merely busy (never an
+  unhealthy, paused, unlisted or stalled one). It does not count against the macOS cap. Stale
+  health or no `github` key: ignored. The step summary lists the saturated families, and the
+  `saturated` output is them as a JSON array.
+- Memory: an entry may state its job's memory need after the image and before `!`:
+  `build=linux-arm64@ubuntu-22.04-arm+16g`, `t=macos-arm64+12g!` (1-999 GB). A job that needs more
+  than its pool holds takes its image whatever is free (`needs 16 GB, denext-linux-arm64 holds 8`);
+  a pinned one stays pinned with a warning. A pool holds its health entry's optional `mem_gb` (the
+  most one job on the label can use, swap included) when the health is fresh, else a default:
+  linux-x64 / -2204 / -docker 7, windows-x64 / -fast / windows-arm64 8, macos-arm64 8, macos-x64 16,
+  linux-arm64 8, linux-arm64-desktop 10.
 - The pool variables (`RUNNER_WINDOWS_X64`, …): unset → the GitHub image; a GitHub image
   (`windows-latest`) → that image (a job's own `@image` wins); our label (`["self-hosted","denext-windows-x64"]`) → our pool
   with overflow.

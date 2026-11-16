@@ -7,7 +7,8 @@ inputs:
   jobs:
     description: >-
       The jobs in priority order, whitespace separated: `key=pool`, `key=pool@image`, `key=pool!`
-      (pinned to our hardware) or `key=~other` (same runner as `other`). Pools: linux-x64,
+      (pinned to our hardware) or `key=~other` (same runner as `other`); a memory need goes after
+      the image and before `!`: `key=pool@image+16g!` (a job its pool cannot hold takes its image). Pools: linux-x64,
       linux-x64-2204, linux-x64-docker, windows-x64, windows-x64-fast (long jobs: the fast host only),
       windows-arm64, macos-arm64, macos-x64, linux-arm64 (the Mac mini's Linux arm64 containers;
       overflow ubuntu-24.04-arm, or the job's own @ubuntu-22.04-arm), linux-arm64-desktop.
@@ -43,6 +44,9 @@ outputs:
   blocked:
     description: "Labels that take no job at all (unhealthy, paused, unlisted, stalled), as a JSON array."
     value: ${{ steps.pick.outputs.blocked }}
+  saturated:
+    description: "GitHub image families (macos, windows, ubuntu) whose queue was saturated, as a JSON array: their jobs waited for our busy pool."
+    value: ${{ steps.pick.outputs.saturated }}
 runs:
   using: composite
   steps:

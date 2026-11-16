@@ -24,10 +24,24 @@ Inputs (environment; the action maps its inputs onto these):
       key=~other          whatever `other` got (a job that `needs` the other
                           one starts in its slot when it ends)
 
+  A non-follower entry may also state the job's memory need, `+<N>g` (N 1-999,
+  in GB), after the optional `@image` and before the optional `!`:
+  `build=linux-arm64@ubuntu-22.04-arm+16g`, `t=macos-arm64+12g!`. A job that
+  needs more than its pool holds (the health entry's `mem_gb`, else
+  POOL_MEM_GB) takes its image whatever is free; a pinned one stays pinned
+  and gets a warning (it may not fit). See `mem_capacity`.
+
   `pool` is a name of POOLS below.
 - PICK_VARS: the workflow's `toJSON(vars)`. The pool variables (RUNNER_*) say
   whether a pool is in use and under which labels; DENEXT_POOL_HEALTH is the
-  fleet's live state (see `free_slots`).
+  fleet's live state (see `free_slots`). Two optional fields of it are read
+  when present (absent or malformed, the picker decides as without them):
+  a pool entry's `mem_gb` (the most memory one job on that label can use,
+  swap it may use included; see `mem_capacity`), and the top-level
+  `github: {"macos"|"windows"|"ubuntu": {"queued": n, "oldest_at": epoch}}`
+  (the org's jobs queued on GitHub's images of that family; see
+  `github_saturated`). Both are as fresh as `checked_at`: stale health
+  ignores them too.
 - PICK_MACOS_CAP: the most macOS jobs this run sends to GitHub (default 3).
   GitHub runs about 5 macOS jobs at once for the whole org; past the cap a
   macOS job waits for our pool instead (when the pool is in use).
@@ -44,7 +58,9 @@ Output (stdout, `$GITHUB_OUTPUT` lines): `plan=<JSON>`, `hosted=<JSON list of
 the keys on GitHub>`, `free=<JSON {label: free slots before this run}>`,
 `blocked=<JSON list of the labels that take no job at all: unhealthy, paused,
 unlisted or stalled in the previous attempt>` (a planner must never make a job
-wait on one of those, macOS cap or not). A
+wait on one of those, macOS cap or not), `saturated=<JSON list of the GitHub
+image families (macos, windows, ubuntu) that were saturated: a job of theirs
+waits for our busy pool instead of joining GitHub's queue>`. A
 decision table goes to stderr (and the step summary, through the action).
 
 This never fails a run: any error sends every job but the pinned ones to its
@@ -94,6 +110,22 @@ VAR_FALLBACK = {"linux-x64-docker": "RUNNER_LINUX_X64"}
 # slot it takes is also one of the other's (and vice versa through the fleet's busy count).
 SUBPOOL_OF = {"windows-x64-fast": "windows-x64"}
 
+# The most memory (GB, swap a job may use included) one job on a pool's label can use, while
+# DENEXT_POOL_HEALTH gives no `mem_gb` for it (stale, or not published). linux-arm64's job
+# container holds 6 GB + 2 GB swap: a deno debug build OOMed there (2026-11-16).
+POOL_MEM_GB = {
+    "linux-x64": 7,
+    "linux-x64-2204": 7,
+    "linux-x64-docker": 7,
+    "windows-x64": 8,
+    "windows-x64-fast": 8,
+    "windows-arm64": 8,
+    "macos-arm64": 8,
+    "macos-x64": 16,
+    "linux-arm64": 8,
+    "linux-arm64-desktop": 10,
+}
+
 # A shared group's capacity variable (biscuits' three labels are one 8-core
 # host's job containers).
 GROUP_SLOTS_VAR = {"biscuits": "RUNNER_LINUX_X64_SHARED_SLOTS"}
@@ -106,6 +138,8 @@ TIMEOUT = 15  # seconds per request
 MAX_PAGES = 5
 MAX_RUNS = 40  # this repository's in-flight runs whose jobs are counted
 GITHUB_IMAGE = re.compile(r"^(ubuntu|windows|macos)-[0-9a-z.-]+$")
+GITHUB_FAMILIES = ("macos", "windows", "ubuntu")
+GITHUB_SATURATED_AFTER = 180  # seconds a family's oldest queued GitHub job waits before it is saturated
 
 
 def _dumps(value):
@@ -166,12 +200,14 @@ class Pool:
 
 JOB = re.compile(
     r"^(?P<key>[A-Za-z0-9_.-]+)=(?:~(?P<follow>[A-Za-z0-9_.-]+)|"
-    r"(?P<pool>[a-z0-9-]+)(?:@(?P<image>[A-Za-z0-9._-]+))?(?P<pin>!)?)$"
+    r"(?P<pool>[a-z0-9-]+)(?:@(?P<image>[A-Za-z0-9._-]+))?"
+    r"(?:\+(?P<mem>[1-9][0-9]{0,2})g)?(?P<pin>!)?)$"
 )
 
 
 def parse_jobs(text):
-    """PICK_JOBS as a list of dicts: key, pool, image, pinned, follow."""
+    """PICK_JOBS as a list of dicts: key, pool, image, mem (GB or None),
+    pinned, follow."""
     jobs, errors = [], []
     for entry in (text or "").split():
         m = JOB.match(entry)
@@ -183,6 +219,7 @@ def parse_jobs(text):
                 "key": m.group("key"),
                 "pool": m.group("pool"),
                 "image": m.group("image"),
+                "mem": int(m.group("mem")) if m.group("mem") else None,
                 "pinned": bool(m.group("pin")),
                 "follow": m.group("follow"),
             }
@@ -193,12 +230,12 @@ def parse_jobs(text):
 # ---- the fleet's state -------------------------------------------------------
 
 
-def fresh_health(value, now):
-    """DENEXT_POOL_HEALTH's `pools` map when `value` parses and is at most
+def _fresh(value, now):
+    """DENEXT_POOL_HEALTH as a dict when `value` parses and is at most
     HEALTH_MAX_AGE old, else None (missing, unparsable or stale)."""
     try:
         health = json.loads(value or "")
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     if not isinstance(health, dict):
         return None
@@ -207,8 +244,67 @@ def fresh_health(value, now):
         return None
     if now - at > HEALTH_MAX_AGE or at - now > 300:
         return None
-    pools = health.get("pools")
+    return health
+
+
+def fresh_health(value, now):
+    """DENEXT_POOL_HEALTH's `pools` map when `value` parses and is at most
+    HEALTH_MAX_AGE old, else None (missing, unparsable or stale)."""
+    health = _fresh(value, now)
+    pools = health.get("pools") if health else None
     return pools if isinstance(pools, dict) else None
+
+
+def github_saturated(value, now):
+    """{family: seconds its oldest queued job has waited} for the GitHub image
+    families (GITHUB_FAMILIES) that are saturated right now: the fresh health's
+    `github.<family>` has `queued` >= 1 and its `oldest_at` at least
+    GITHUB_SATURATED_AFTER seconds ago.
+
+    Why (laufey run of 2026-11-16): GitHub's macOS arm64 capacity was degraded;
+    a job sent to `macos-15` because our mac-arm pool was busy sat in GitHub's
+    queue until GitHub cancelled it after 15 min ("not acquired by Runner of type
+    hosted"), twice, while our own pool freed minutes later. When GitHub already
+    has a job of the family waiting that long, a busy pool of ours is the faster
+    queue. Stale health, no `github` key, a family it does not list, or a
+    malformed entry (no count, no `oldest_at`): not saturated (as before the
+    field existed)."""
+    health = _fresh(value, now)
+    github = health.get("github") if health else None
+    if not isinstance(github, dict):
+        return {}
+    out = {}
+    for family in GITHUB_FAMILIES:
+        e = github.get(family)
+        if not isinstance(e, dict):
+            continue
+        queued, oldest = _n(e.get("queued")), _n(e.get("oldest_at"))
+        if not queued or not oldest:
+            continue
+        if now - oldest >= GITHUB_SATURATED_AFTER:
+            out[family] = int(now - oldest)
+    return out
+
+
+def image_family(image):
+    """The GitHub image family of a runs-on image (`macos-15` -> macos), or None
+    for anything that is not one of GITHUB_FAMILIES."""
+    if not isinstance(image, str):
+        return None
+    family = image.split("-", 1)[0]
+    return family if family in GITHUB_FAMILIES else None
+
+
+def mem_capacity(pool, health_pools):
+    """The most memory (GB) one job on `pool` can use: its fresh health entry's
+    `mem_gb` (a positive number) when the fleet publishes one, else the static
+    POOL_MEM_GB default. The fleet's number wins because it is measured (a
+    container's limit plus the swap it may use), the default only a floor that
+    keeps a stale value from sending an over-sized job to a pool it cannot fit
+    (the linux-arm64 OOM of 2026-11-16)."""
+    entry = (health_pools or {}).get(pool.label)
+    gb = _n(entry.get("mem_gb")) if isinstance(entry, dict) else None
+    return gb if gb else POOL_MEM_GB[pool.name]
 
 
 def _n(value):
@@ -330,14 +426,22 @@ def free_slots(pools_in_use, health_pools, variables, counts, stalled):
 # ---- the decision ------------------------------------------------------------
 
 
-def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
+def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their
-    slots whatever is free), then the rest in priority order: our pool while it
-    and its group have a free slot, else the image; a macOS job past the macOS
-    cap waits for our pool instead. Followers copy their target."""
+    slots whatever is free), then the rest in priority order: a job that needs
+    more memory than its pool holds takes its image; else our pool while it and
+    its group have a free slot, else the image; a macOS job past the macOS cap,
+    or a job whose image family is saturated on GitHub (`saturated`, from
+    `github_saturated`), waits for our pool instead, but only for a pool that is
+    merely busy (no `notes` entry). `mem` is {pool name: GB} (`mem_capacity`;
+    POOL_MEM_GB for a pool it leaves out). Followers copy their target."""
     free = dict(free)
     groups = dict(groups)
+    notes, saturated = notes or {}, saturated or {}
     plan, rows = {}, {}
+
+    def mem_of(p):
+        return (mem or {}).get(p.name) or POOL_MEM_GB[p.name]
 
     def take(p):
         free[p.label] = free.get(p.label, 0) - 1
@@ -359,7 +463,10 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
             continue
         take(p)
         plan[job["key"]] = p.pinned_runs_on
-        rows[job["key"]] = (p.name, "ours (pinned)", "needs our hardware")
+        why = "needs our hardware"
+        if job["mem"] and job["mem"] > mem_of(p):
+            why += f"; needs {job['mem']} GB, {p.label} holds {mem_of(p)} (may not fit)"
+        rows[job["key"]] = (p.name, "ours (pinned)", why)
     hosted_macos = 0
     for job in jobs:
         if job["follow"] or job["pinned"]:
@@ -374,12 +481,17 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
         elif p.mode == "image":
             # the job's own @image wins (a leg keeps the image its build ran on)
             plan[key], rows[key] = job["image"] or p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
+        elif job["mem"] and job["mem"] > mem_of(p):
+            # our pool cannot hold the job (the linux-arm64 OOM): GitHub's image whatever is free
+            if p.macos:
+                hosted_macos += 1
+            plan[key], rows[key] = image, (p.name, "GitHub", f"needs {job['mem']} GB, {p.label} holds {mem_of(p)}")
         elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) > 0) and (
             p.parent_label not in free or free[p.parent_label] > 0
         ):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
-        elif p.macos and hosted_macos >= macos_cap and not (notes or {}).get(p.label):
+        elif p.macos and hosted_macos >= macos_cap and not notes.get(p.label):
             # GitHub's macOS share is spent: wait for our pool, but only for a pool that is
             # merely busy (never one that is unhealthy, paused, unlisted or stalled).
             plan[key], rows[key] = p.runs_on, (
@@ -387,10 +499,21 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None):
                 "ours (waits)",
                 f"no free slot, but this run already sent {hosted_macos} macOS job(s) to GitHub (cap {macos_cap})",
             )
+        elif image_family(image) in saturated and not notes.get(p.label):
+            # GitHub has had a job of this family queued for minutes: our busy pool frees sooner.
+            # Not counted against the macOS cap (the job does not go to GitHub).
+            family = image_family(image)
+            busy = "no free slot" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full"
+            plan[key], rows[key] = p.runs_on, (
+                p.name,
+                "ours (waits)",
+                f"{busy}, but GitHub's {family} images have had a job queued for"
+                f" {saturated[family] // 60} min (saturated)",
+            )
         else:
             if p.macos:
                 hosted_macos += 1
-            why = (notes or {}).get(p.label) or (
+            why = notes.get(p.label) or (
                 f"no free slot on {p.label}" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full"
             )
             plan[key], rows[key] = image, (p.name, "GitHub", why)
@@ -616,13 +739,13 @@ def is_fork_pr(env):
     return head != env.get("GITHUB_REPOSITORY")
 
 
-LAST = {"blocked": []}  # side output of the latest pick() (kept out of its return value)
+LAST = {"blocked": [], "saturated": {}}  # side output of the latest pick() (kept out of its return value)
 
 
 def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=time.sleep,
          clock=time.monotonic):
     """(plan, rows, free) for the environment `env` (see the module docstring)."""
-    LAST["blocked"] = []
+    LAST["blocked"], LAST["saturated"] = [], {}
     now = time.time() if now is None else now
     jobs, bad = parse_jobs(env.get("PICK_JOBS"))
     for entry in bad:
@@ -642,11 +765,18 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         macos_cap = DEFAULT_MACOS_CAP
     in_use = [p for p in pools.values() if p.mode == "ours"]
     pinned_only = all(j["pinned"] or j["follow"] for j in jobs)
+    health = fresh_health(variables.get("DENEXT_POOL_HEALTH"), now)
+    saturated = github_saturated(variables.get("DENEXT_POOL_HEALTH"), now)
+    LAST["saturated"] = saturated
+    mem = {name: mem_capacity(p, health) for name, p in pools.items()}
+    for job in jobs:
+        if job["pinned"] and job["mem"] and not fork_pr and job["mem"] > mem[job["pool"]]:
+            warn(f"pick-runners: {job['key']} needs {job['mem']} GB but is pinned to"
+                 f" {pools[job['pool']].label}, which holds {mem[job['pool']]}: it may not fit")
     if fork_pr or not in_use or pinned_only:
-        plan, rows = allocate(jobs, pools, {}, {}, macos_cap, fork_pr)
+        plan, rows = allocate(jobs, pools, {}, {}, macos_cap, fork_pr, mem=mem)
         return plan, rows, {}
     try:
-        health = fresh_health(variables.get("DENEXT_POOL_HEALTH"), now)
         if health is None:
             warn("pick-runners: DENEXT_POOL_HEALTH is missing, unparsable or older than 10 min:"
                  f" at most {STALE_FREE} job per pool goes to our runners")
@@ -693,7 +823,7 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
                 warn(f"pick-runners: listing the org's runners failed ({e}); ignored")
         free, groups = free_slots(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
-        plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes)
+        plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem)
         LAST["blocked"] = sorted(l for l, n in notes.items() if n)
         return plan, rows, free
     except Exception as e:  # never fail the run
@@ -702,13 +832,17 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         return plan, [(k, "?", "GitHub", "picker error", v) for k, v in plan.items()], {}
 
 
-def table(rows, free):
+def table(rows, free, saturated=None):
     lines = ["| job | pool | decision | why | runs-on |", "| --- | --- | --- | --- | --- |"]
     for key, pool, decision, why, runs_on in rows:
         lines.append(f"| {key} | {pool} | {decision} | {why} | `{_dumps(runs_on)}` |")
     if free:
         lines.append("")
         lines.append("Free slots before this run: " + ", ".join(f"{l} {n}" for l, n in sorted(free.items())))
+    if saturated:
+        lines.append("")
+        lines.append("GitHub saturated: " + ", ".join(
+            f"{f} (queued {s // 60} min)" for f, s in sorted(saturated.items())))
     return "\n".join(lines)
 
 
@@ -733,12 +867,13 @@ def main(argv):
     print(f"hosted={_dumps(hosted)}")
     print(f"free={_dumps(free)}")
     print(f"blocked={_dumps(LAST['blocked'])}")
-    print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free), file=sys.stderr)
+    print(f"saturated={_dumps(sorted(LAST['saturated']))}")
+    print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free, LAST["saturated"]), file=sys.stderr)
     summary = env.get("GITHUB_STEP_SUMMARY")
     if summary and not dry:
         try:
             with open(summary, "a", encoding="utf-8") as f:
-                f.write("### Runner picks\n\n" + table(rows, free) + "\n")
+                f.write("### Runner picks\n\n" + table(rows, free, LAST["saturated"]) + "\n")
         except OSError:
             pass
     return 0

@@ -613,5 +613,177 @@ class CliTest(unittest.TestCase):
         self.assertIn("| b | windows-x64 | GitHub |", out.stderr)
 
 
+def health_gh(pools, github, age=60):
+    return json.dumps({"v": 1, "checked_at": NOW - age, "pools": pools, "github": github})
+
+
+class SaturationTest(unittest.TestCase):
+    """GitHub's macOS arm64 capacity degraded (laufey, 2026-11-16): a job sent to macos-15
+    because our pool was busy queued until GitHub cancelled it; our pool freed minutes later."""
+
+    def test_saturated_family_sends_a_busy_pool_job_to_our_pool(self):
+        h = health_gh({"denext-macos-arm64": entry(1, busy=1)}, {"macos": {"queued": 2, "oldest_at": NOW - 420}})
+        plan, rows, _, _ = run(env("a=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan["a"], ours(MAC))
+        self.assertEqual(rows[0][2], "ours (waits)")
+        self.assertIn("GitHub's macos images have had a job queued for 7 min (saturated)", rows[0][3])
+        self.assertEqual(pr.LAST["saturated"], {"macos": 420})
+
+    def test_below_the_threshold_is_not_saturated(self):
+        h = health_gh({"denext-macos-arm64": entry(1, busy=1)}, {"macos": {"queued": 3, "oldest_at": NOW - 179}})
+        plan, _, _, _ = run(env("a=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan["a"], "macos-15")
+        self.assertEqual(pr.LAST["saturated"], {})
+
+    def test_stale_health_ignores_github(self):
+        h = health_gh({"denext-macos-arm64": entry(1, busy=1)},
+                      {"macos": {"queued": 2, "oldest_at": NOW - 3600}}, age=11 * 60)
+        api = FakeApi(runs=[{"id": 7, "status": "in_progress"}],
+                      jobs={"7": [{"status": "in_progress", "labels": ["denext-macos-arm64"]}]})
+        plan, _, _, _ = run(env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC), get=api)
+        self.assertEqual(plan["a"], "macos-latest")
+        self.assertEqual(pr.github_saturated(h, NOW), {})
+
+    def test_never_strands_a_job_on_an_unhealthy_pool(self):
+        sat = {"macos": {"queued": 2, "oldest_at": NOW - 900}}
+        for pools in ({"denext-macos-arm64": dict(entry(1), ok=False)},
+                      {"denext-macos-arm64": entry(1, busy=1, paused=True)},
+                      {}):
+            plan, rows, _, _ = run(env("a=macos-arm64", health_gh(pools, sat), RUNNER_MACOS_ARM=MAC))
+            self.assertEqual(plan["a"], "macos-latest", pools)
+            self.assertEqual(rows[0][2], "GitHub")
+
+    def test_never_strands_a_job_on_a_stalled_pool(self):
+        h = health_gh({"denext-macos-arm64": entry(1, busy=1)}, {"macos": {"queued": 1, "oldest_at": NOW - 900}})
+        e = env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC)
+        e["GITHUB_RUN_ATTEMPT"] = "2"
+        api = FakeApi(attempt_jobs=[{"conclusion": "cancelled", "runner_name": None,
+                                     "labels": ["self-hosted", "denext-macos-arm64"]}])
+        self.assertEqual(run(e, get=api)[0]["a"], "macos-latest")
+
+    def test_windows_and_ubuntu_families(self):
+        h = health_gh({"denext-windows-x64": entry(1, busy=1), "denext-linux-arm64": entry(1, busy=1),
+                       "denext-linux-x64": entry(1, busy=1)},
+                      {"windows": {"queued": 1, "oldest_at": NOW - 240},
+                       "ubuntu": {"queued": 4, "oldest_at": NOW - 600},
+                       "macos": {"queued": 0, "oldest_at": None}})
+        plan, rows, _, _ = run(env("w=windows-x64 u=linux-arm64@ubuntu-22.04-arm l=linux-x64", h,
+                                   RUNNER_WINDOWS_X64=WIN, RUNNER_LINUX_ARM64=LinuxArm64Test.ARM,
+                                   RUNNER_LINUX_X64=LINUX))
+        self.assertEqual(plan, {"w": ours(WIN), "u": ours(LinuxArm64Test.ARM), "l": ours(LINUX)})
+        self.assertIn("windows images", rows[0][3])
+        self.assertIn("ubuntu images", rows[1][3])
+        self.assertEqual(sorted(pr.LAST["saturated"]), ["ubuntu", "windows"])
+
+    def test_only_the_jobs_own_family_counts(self):
+        h = health_gh({"denext-windows-x64": entry(1, busy=1)}, {"macos": {"queued": 1, "oldest_at": NOW - 900}})
+        plan, _, _, _ = run(env("w=windows-x64", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan["w"], "windows-latest")
+
+    def test_no_github_key_is_unchanged(self):
+        h = health({"denext-macos-arm64": entry(1, busy=1)})
+        plan, rows, _, _ = run(env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan["a"], "macos-latest")
+        self.assertEqual(pr.LAST["saturated"], {})
+
+    def test_malformed_github_is_unknown(self):
+        for gh in ("nope", {"macos": "x"}, {"macos": {"queued": "2", "oldest_at": NOW - 900}},
+                   {"macos": {"queued": 2, "oldest_at": None}}, {"macos": {"queued": True, "oldest_at": NOW - 900}}):
+            self.assertEqual(pr.github_saturated(health_gh({}, gh), NOW), {}, gh)
+
+    def test_saturation_does_not_count_against_the_macos_cap(self):
+        h = health_gh({"denext-macos-arm64": entry(1, busy=1), "denext-macos-x64": entry(1, busy=1)},
+                      {"macos": {"queued": 1, "oldest_at": NOW - 900}})
+        e = env("a=macos-arm64 b=macos-x64+32g", h, RUNNER_MACOS_ARM=MAC, RUNNER_MACOS_X64=MACX)
+        e["PICK_MACOS_CAP"] = "1"
+        plan, rows, _, _ = run(e)
+        # a waits on ours (saturated, cap untouched); b cannot fit ours: GitHub, the one hosted macOS job
+        self.assertEqual(plan, {"a": ours(MAC), "b": "macos-15-intel"})
+        self.assertIn("saturated", rows[0][3])
+
+
+class MemoryTest(unittest.TestCase):
+    ARM = '["self-hosted","denext-linux-arm64"]'
+
+    def test_grammar(self):
+        jobs, bad = pr.parse_jobs("a=linux-arm64+16g b=linux-arm64@ubuntu-22.04-arm+999g c=macos-arm64+12g! "
+                                  "d=linux-x64 e=linux-x64@ubuntu-24.04! f=~a")
+        self.assertEqual([(j["key"], j["image"], j["mem"], j["pinned"]) for j in jobs],
+                         [("a", None, 16, False), ("b", "ubuntu-22.04-arm", 999, False), ("c", None, 12, True),
+                          ("d", None, None, False), ("e", "ubuntu-24.04", None, True), ("f", None, None, False)])
+        self.assertEqual(bad, [])
+
+    def test_malformed_suffix(self):
+        entries = ["a=linux-arm64+0g", "b=linux-arm64+16", "c=linux-arm64+1000g", "d=linux-arm64+16G",
+                   "e=linux-arm64!+16g", "f=linux-arm64+016g", "g=~a+4g", "h=linux-arm64+g"]
+        jobs, bad = pr.parse_jobs(" ".join(entries))
+        self.assertEqual(jobs, [])
+        self.assertEqual(bad, entries)
+        _, _, _, warnings = run(env("b=linux-arm64+16", health({}), RUNNER_LINUX_ARM64=self.ARM))
+        self.assertTrue(any("malformed or unknown job entry 'b=linux-arm64+16'" in w for w in warnings))
+
+    def test_over_the_health_mem_goes_to_github_with_a_free_slot(self):
+        h = health({"denext-linux-arm64": dict(entry(2), mem_gb=8)})
+        plan, rows, _, _ = run(env("b=linux-arm64@ubuntu-22.04-arm+16g c=linux-arm64", h, RUNNER_LINUX_ARM64=self.ARM))
+        self.assertEqual(plan, {"b": "ubuntu-22.04-arm", "c": ours(self.ARM)})
+        self.assertEqual(rows[0][2:4], ("GitHub", "needs 16 GB, denext-linux-arm64 holds 8"))
+
+    def test_over_capacity_ignores_saturation(self):
+        h = health_gh({"denext-linux-arm64": dict(entry(1, busy=1), mem_gb=8)},
+                      {"ubuntu": {"queued": 3, "oldest_at": NOW - 900}})
+        plan, rows, _, _ = run(env("b=linux-arm64+16g", h, RUNNER_LINUX_ARM64=self.ARM))
+        self.assertEqual(plan["b"], "ubuntu-24.04-arm")
+        self.assertIn("needs 16 GB", rows[0][3])
+
+    def test_under_the_health_mem_is_ours(self):
+        h = health({"denext-linux-arm64": dict(entry(1), mem_gb=24)})
+        plan, _, _, _ = run(env("b=linux-arm64+16g", h, RUNNER_LINUX_ARM64=self.ARM))
+        self.assertEqual(plan["b"], ours(self.ARM))
+
+    def test_stale_health_uses_the_static_default(self):
+        h = health({"denext-linux-arm64": dict(entry(1), mem_gb=24)}, age=11 * 60)
+        plan, rows, _, _ = run(env("b=linux-arm64+16g c=linux-arm64+8g", h, RUNNER_LINUX_ARM64=self.ARM))
+        self.assertEqual(plan, {"b": "ubuntu-24.04-arm", "c": ours(self.ARM)})
+        self.assertEqual(rows[0][3], "needs 16 GB, denext-linux-arm64 holds 8")
+        self.assertEqual(pr.mem_capacity(pr.Pool("macos-x64", {}), None), 16)
+
+    def test_pinned_over_capacity_stays_pinned_and_warns(self):
+        h = health({"denext-linux-arm64-desktop": dict(entry(1), mem_gb=4)})
+        plan, rows, _, warnings = run(env("g=linux-arm64-desktop+6g!", h))
+        self.assertEqual(plan["g"], ["self-hosted", "denext-linux-arm64-desktop"])
+        self.assertEqual(rows[0][2], "ours (pinned)")
+        self.assertIn("holds 4 (may not fit)", rows[0][3])
+        self.assertTrue(any("g needs 6 GB but is pinned to denext-linux-arm64-desktop, which holds 4" in w
+                            for w in warnings))
+
+
+class SaturatedOutputTest(unittest.TestCase):
+    def test_saturated_output_line_and_summary(self):
+        e = dict(os.environ)
+        t = int(__import__("time").time())
+        e.update(env("a=macos-arm64@macos-15 b=linux-arm64+16g", json.dumps(
+            {"v": 1, "checked_at": t, "pools": {"denext-macos-arm64": entry(1, busy=1),
+                                                "denext-linux-arm64": dict(entry(1), mem_gb=8)},
+             "github": {"macos": {"queued": 1, "oldest_at": t - 7 * 60 - 5}}}),
+            RUNNER_MACOS_ARM=MAC, RUNNER_LINUX_ARM64=LinuxArm64Test.ARM))
+        e["PICK_DRY_RUN"] = "true"
+        e.pop("GITHUB_EVENT_PATH", None)
+        out = subprocess.run([sys.executable, "-I", pr.__file__], env=e, capture_output=True, text=True, check=True)
+        lines = dict(l.split("=", 1) for l in out.stdout.splitlines())
+        self.assertEqual(json.loads(lines["saturated"]), ["macos"])
+        self.assertEqual(json.loads(lines["plan"]), {"a": ours(MAC), "b": "ubuntu-24.04-arm"})
+        self.assertIn("GitHub saturated: macos (queued 7 min)", out.stderr)
+        self.assertIn("| a | macos-arm64 | ours (waits) |", out.stderr)
+
+    def test_no_saturation_prints_an_empty_list(self):
+        e = dict(os.environ)
+        e.update(env("a=windows-x64", "", RUNNER_WINDOWS_X64=WIN))
+        e["PICK_DRY_RUN"] = "true"
+        out = subprocess.run([sys.executable, "-I", pr.__file__], env=e, capture_output=True, text=True, check=True)
+        lines = dict(l.split("=", 1) for l in out.stdout.splitlines())
+        self.assertEqual(json.loads(lines["saturated"]), [])
+        self.assertNotIn("GitHub saturated", out.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
