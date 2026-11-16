@@ -161,6 +161,25 @@ class FreeSlotTest(unittest.TestCase):
         self.assertTrue(any("counting" in w for w in warnings))
 
 
+class LinuxArm64Test(unittest.TestCase):
+    ARM = '["self-hosted","denext-linux-arm64"]'
+
+    def test_free_slot_then_each_jobs_own_overflow_image(self):
+        h = health({"denext-linux-arm64": entry(1)})
+        plan, rows, _, _ = run(env("a=linux-arm64 b=linux-arm64@ubuntu-22.04-arm c=linux-arm64", h, RUNNER_LINUX_ARM64=self.ARM))
+        self.assertEqual(plan, {"a": ours(self.ARM), "b": "ubuntu-22.04-arm", "c": "ubuntu-24.04-arm"})
+
+    def test_unhealthy_overflows(self):
+        h = health({"denext-linux-arm64": entry(1, ok=False)})
+        plan, _, _, _ = run(env("a=linux-arm64@ubuntu-22.04-arm", h, RUNNER_LINUX_ARM64=self.ARM))
+        self.assertEqual(plan, {"a": "ubuntu-22.04-arm"})
+
+    def test_variable_unset_is_github(self):
+        h = health({"denext-linux-arm64": entry(1)})
+        plan, _, _, _ = run(env("a=linux-arm64 b=linux-arm64@ubuntu-22.04-arm", h))
+        self.assertEqual(plan, {"a": "ubuntu-24.04-arm", "b": "ubuntu-22.04-arm"})
+
+
 class HealthTest(unittest.TestCase):
     def test_not_ok_is_zero(self):
         h = health({"denext-windows-x64": dict(entry(2, ok=False), reason="guest unreachable")})

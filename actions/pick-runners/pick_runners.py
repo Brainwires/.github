@@ -79,6 +79,9 @@ POOLS = {
     "windows-arm64": ("RUNNER_WINDOWS_ARM", "denext-windows-arm64", "windows-11-arm", None, False),
     "macos-arm64": ("RUNNER_MACOS_ARM", "denext-macos-arm64", "macos-latest", None, True),
     "macos-x64": ("RUNNER_MACOS_X64", "denext-macos-x64", "macos-15-intel", None, True),
+    # Linux arm64 job containers on the Mac mini (Docker Desktop; Ubuntu 22.04 image, so a job that needs
+    # GitHub's 22.04 ARM image on overflow names it: `key=linux-arm64@ubuntu-22.04-arm`).
+    "linux-arm64": ("RUNNER_LINUX_ARM64", "denext-linux-arm64", "ubuntu-24.04-arm", None, False),
     # The Pi (GNOME session on arm64): no GitHub equivalent; pinned jobs only.
     "linux-arm64-desktop": ("RUNNER_LINUX_ARM64_DESKTOP", "denext-linux-arm64-desktop", "ubuntu-24.04-arm", None, False),
 }

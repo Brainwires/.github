@@ -9,8 +9,8 @@ inputs:
       The jobs in priority order, whitespace separated: `key=pool`, `key=pool@image`, `key=pool!`
       (pinned to our hardware) or `key=~other` (same runner as `other`). Pools: linux-x64,
       linux-x64-2204, linux-x64-docker, windows-x64, windows-x64-fast (long jobs: the fast host only),
-      windows-arm64, macos-arm64, macos-x64,
-      linux-arm64-desktop.
+      windows-arm64, macos-arm64, macos-x64, linux-arm64 (the Mac mini's Linux arm64 containers;
+      overflow ubuntu-24.04-arm, or the job's own @ubuntu-22.04-arm), linux-arm64-desktop.
     required: true
   vars:
     description: "The workflow's `toJSON(vars)` (the RUNNER_* pool variables and DENEXT_POOL_HEALTH)."

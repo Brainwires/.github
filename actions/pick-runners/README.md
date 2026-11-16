@@ -62,7 +62,9 @@ its GitHub image.
 Pools: `linux-x64`, `linux-x64-2204`, `linux-x64-docker` (biscuits, shared capacity),
 `windows-x64`, `windows-x64-fast` (long jobs: only the fast Windows host, label
 `denext-windows-x64-fast`; it shares `windows-x64`'s slots, and when that host is busy the job
-goes to GitHub, never to the slow host), `windows-arm64`, `macos-arm64`, `macos-x64`, `linux-arm64-desktop` (the Pi; pinned
+goes to GitHub, never to the slow host), `windows-arm64`, `macos-arm64`, `macos-x64`, `linux-arm64` (Linux arm64
+containers on the Mac mini, variable `RUNNER_LINUX_ARM64`, label `denext-linux-arm64`; overflow `ubuntu-24.04-arm`, so a job
+that needs GitHub's 22.04 ARM image on overflow writes `key=linux-arm64@ubuntu-22.04-arm`), `linux-arm64-desktop` (the Pi; pinned
 jobs only). See `pick_runners.py` for the full rules; tests: `python3 -I pick_runners_test.py`.
 
 Dry run (no API call), e.g. against the live value:
