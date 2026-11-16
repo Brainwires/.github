@@ -629,6 +629,15 @@ class SaturationTest(unittest.TestCase):
         self.assertIn("GitHub's macos images have had a job queued for 7 min (saturated)", rows[0][3])
         self.assertEqual(pr.LAST["saturated"], {"macos": 420})
 
+    def test_saturated_waits_are_bounded_per_pool(self):
+        # 2026-11-16: every macOS job of a run waited for a 2-slot pool, 6 deep, while GitHub emptied.
+        h = health_gh({"denext-macos-arm64": entry(2, busy=2)}, {"macos": {"queued": 4, "oldest_at": NOW - 600}})
+        plan, rows, _, _ = run(env("a=macos-arm64@macos-15 b=macos-arm64@macos-15 c=macos-arm64@macos-15"
+                                   " d=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual([plan[k] for k in "abcd"], [ours(MAC), ours(MAC), "macos-15", "macos-15"])
+        self.assertEqual([r[2] for r in rows], ["ours (waits)", "ours (waits)", "GitHub", "GitHub"])
+        self.assertIn("already wait for it", rows[2][3])
+
     def test_below_the_threshold_is_not_saturated(self):
         h = health_gh({"denext-macos-arm64": entry(1, busy=1)}, {"macos": {"queued": 3, "oldest_at": NOW - 179}})
         plan, _, _, _ = run(env("a=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))

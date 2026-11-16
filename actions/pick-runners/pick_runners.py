@@ -139,6 +139,7 @@ MAX_PAGES = 5
 MAX_RUNS = 40  # this repository's in-flight runs whose jobs are counted
 GITHUB_IMAGE = re.compile(r"^(ubuntu|windows|macos)-[0-9a-z.-]+$")
 GITHUB_FAMILIES = ("macos", "windows", "ubuntu")
+WAIT_DEPTH = 2  # jobs of one run that may wait for one busy pool of ours (2026-11-16: 6 macOS jobs queued behind 2 slots while GitHub emptied); past it they overflow
 GITHUB_SATURATED_AFTER = 180  # seconds a family's oldest queued GitHub job waits before it is saturated
 
 
@@ -468,6 +469,7 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             why += f"; needs {job['mem']} GB, {p.label} holds {mem_of(p)} (may not fit)"
         rows[job["key"]] = (p.name, "ours (pinned)", why)
     hosted_macos = 0
+    waits = {}  # label -> jobs of this run that wait for it (at most WAIT_DEPTH)
     for job in jobs:
         if job["follow"] or job["pinned"]:
             continue
@@ -491,7 +493,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
         ):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
-        elif p.macos and hosted_macos >= macos_cap and not notes.get(p.label):
+        elif p.macos and hosted_macos >= macos_cap and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
+            waits[p.label] = waits.get(p.label, 0) + 1
             # GitHub's macOS share is spent: wait for our pool, but only for a pool that is
             # merely busy (never one that is unhealthy, paused, unlisted or stalled).
             plan[key], rows[key] = p.runs_on, (
@@ -499,7 +502,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
                 "ours (waits)",
                 f"no free slot, but this run already sent {hosted_macos} macOS job(s) to GitHub (cap {macos_cap})",
             )
-        elif image_family(image) in saturated and not notes.get(p.label):
+        elif image_family(image) in saturated and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
+            waits[p.label] = waits.get(p.label, 0) + 1
             # GitHub has had a job of this family queued for minutes: our busy pool frees sooner.
             # Not counted against the macOS cap (the job does not go to GitHub).
             family = image_family(image)
@@ -516,6 +520,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             why = notes.get(p.label) or (
                 f"no free slot on {p.label}" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full"
             )
+            if waits.get(p.label, 0) >= WAIT_DEPTH:
+                why += f" ({WAIT_DEPTH} job(s) of this run already wait for it)"
             plan[key], rows[key] = image, (p.name, "GitHub", why)
     for job in jobs:
         if job["follow"]:
