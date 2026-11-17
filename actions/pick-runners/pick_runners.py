@@ -41,7 +41,7 @@ Inputs (environment; the action maps its inputs onto these):
   `github: {"macos"|"windows"|"ubuntu": {"queued": n, "oldest_at": epoch}}`
   (the org's jobs queued on GitHub's images of that family; see
   `github_saturated`). Both are as fresh as `checked_at`: stale health
-  ignores them too.
+  ignores them too, and an aged one (`aged_health`) keeps `mem_gb` only.
 - PICK_MACOS_CAP: the most macOS jobs this run sends to GitHub (default 3).
   GitHub runs about 5 macOS jobs at once for the whole org; past the cap a
   macOS job waits for our pool instead (when the pool is in use).
@@ -131,6 +131,12 @@ POOL_MEM_GB = {
 GROUP_SLOTS_VAR = {"biscuits": "RUNNER_LINUX_X64_SHARED_SLOTS"}
 
 HEALTH_MAX_AGE = 10 * 60  # seconds: an older DENEXT_POOL_HEALTH is stale
+# GitHub fixes a run's `vars` (so DENEXT_POOL_HEALTH) when the run (attempt) starts, not when a job
+# starts: a picker behind a 25-min build reads a 30-min-old value however often the fleet publishes
+# (Brainwires/deno run 44005663132, 2026-11-17: four pickers from 02:48 to 03:28 all read the value
+# checked at 02:42). Such a value, fresh when the run started and at most this old, is "aged": see
+# `aged_health`.
+AGED_MAX_AGE = 90 * 60
 STALE_FREE = 1  # slots per pool (and per shared group) while the health is stale
 DEFAULT_MACOS_CAP = 3
 ACTIVE = {"queued", "in_progress", "waiting", "pending", "requested"}
@@ -254,6 +260,39 @@ def fresh_health(value, now):
     health = _fresh(value, now)
     pools = health.get("pools") if health else None
     return pools if isinstance(pools, dict) else None
+
+
+def aged_health(value, now, started):
+    """DENEXT_POOL_HEALTH's `pools` map when it is no longer fresh only because
+    GitHub froze it when this run (attempt) started at `started` (epoch): it was
+    at most HEALTH_MAX_AGE old then, and is at most AGED_MAX_AGE old now. Else
+    None (`started` unknown, already stale when the run began, too old, or
+    unparsable). The picker then trusts its pool STATES (ok, paused, slots,
+    healthy_slots, mem_gb: an unhealthy pool stays blocked) and counts the jobs
+    itself; its `github` queue is ignored (stale, as before)."""
+    if started is None:
+        return None
+    try:
+        health = json.loads(value or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(health, dict):
+        return None
+    at = health.get("checked_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    if now - at > AGED_MAX_AGE or at - now > 300 or started - at > HEALTH_MAX_AGE:
+        return None
+    pools = health.get("pools")
+    return pools if isinstance(pools, dict) else None
+
+
+def run_started(get, repo, run_id):
+    """When this run's current attempt started (epoch), from the run itself."""
+    run = get(f"/repos/{repo}/actions/runs/{run_id}")
+    if not isinstance(run, dict):
+        return None
+    return _epoch(run.get("run_started_at")) or _epoch(run.get("created_at"))
 
 
 def github_saturated(value, now):
@@ -783,6 +822,21 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         plan, rows = allocate(jobs, pools, {}, {}, macos_cap, fork_pr, mem=mem)
         return plan, rows, {}
     try:
+        repo, run_id = env.get("GITHUB_REPOSITORY", ""), env.get("GITHUB_RUN_ID", "")
+        aged = False
+        if health is None and get is not None:
+            try:
+                started = run_started(get, repo, run_id)
+            except Exception:  # advisory: the stale path below
+                started = None
+            health = aged_health(variables.get("DENEXT_POOL_HEALTH"), now, started)
+            if health is not None:
+                aged = True
+                mem = {name: mem_capacity(p, health) for name, p in pools.items()}
+                at = json.loads(variables["DENEXT_POOL_HEALTH"])["checked_at"]
+                warn(f"pick-runners: DENEXT_POOL_HEALTH is {int(now - at) // 60} min old (GitHub fixes vars"
+                     f" when the run starts; this picker runs {int(now - started) // 60} min later):"
+                     " using its pool states, with the jobs counted here")
         if health is None:
             warn("pick-runners: DENEXT_POOL_HEALTH is missing, unparsable or older than 10 min:"
                  f" at most {STALE_FREE} job per pool goes to our runners")
@@ -790,7 +844,6 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         labels = sorted({p.label for p in in_use} |
                         {POOLS[n][1] for n in POOLS if POOLS[n][3] in groups_in_use})
         counts, stalled = Counts(), set()
-        repo, run_id = env.get("GITHUB_REPOSITORY", ""), env.get("GITHUB_RUN_ID", "")
         if get is not None:
             try:
                 attempt = int(env.get("GITHUB_RUN_ATTEMPT") or "1")
@@ -827,6 +880,10 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
                 counts.busy_runners = busy_runners(runner_get, repo.split("/")[0], labels)
             except Exception as e:
                 warn(f"pick-runners: listing the org's runners failed ({e}); ignored")
+        if aged and counts.busy_runners is not None:
+            # The org's busy runners are counted live: the published busy / queued are as old as the value.
+            health = {l: ({k: v for k, v in e.items() if k not in ("busy", "queued")} if isinstance(e, dict) else e)
+                      for l, e in health.items()}
         free, groups = free_slots(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem)

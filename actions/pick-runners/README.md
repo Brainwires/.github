@@ -40,7 +40,14 @@ our pool while it (and, for biscuits' three Linux labels, their shared capacity)
 its GitHub image.
 
 - `ok: false`, `paused: true` or a label the value does not list: 0 free.
-- The value missing, unparsable or older than 10 min: at most 1 job per pool (fail open toward speed).
+- GitHub fixes a run's `vars` when the run (attempt) starts, so a picker that runs later (a leg's
+  picker after its build, 30 min in) reads an old value however often the fleet publishes. A value
+  that was at most 10 min old when the run started and is at most 90 min old now is used for the
+  pools' states (ok, paused, slots, `mem_gb`; an unhealthy pool stays blocked), with the jobs counted
+  by the picker itself (the org's busy runners with `runner-token`, else the published load as well);
+  its `github` queue is ignored. One extra API call (the run's `run_started_at`), only then.
+- The value missing, unparsable, already stale when the run started, or older than 90 min: at most
+  1 job per pool (fail open toward speed).
 - Same-second siblings: workflows dispatched together (a release gate, a fork train's tests and
   runtime runs) would each count the pools before the other has queued its jobs. A run waits
   (polling every 5 s, at most `settle`, default 90 s) while an EARLIER run of the same repository,
