@@ -36,7 +36,7 @@ org variable `DENEXT_POOL_HEALTH` (the fleet watchdog publishes it about every 2
 `queued` is the larger of the fleet's org-wide count and this repository's other runs' queued jobs
 (fresher). `busy` and `running + queued` overlap (a booting runner's job is both), so they are never
 added. Then, in the order given: pinned jobs (`!`) take our pool regardless; every other job takes
-our pool while it (and, for biscuits' three Linux labels, their shared capacity) has a slot, else
+our pool while it (and, for the Linux host's three labels, their shared capacity) has a slot, else
 its GitHub image.
 
 - `ok: false`, `paused: true` or a label the value does not list: 0 free.
@@ -81,11 +81,11 @@ its GitHub image.
   (`windows-latest`) → that image (a job's own `@image` wins); our label (`["self-hosted","denext-windows-x64"]`) → our pool
   with overflow.
 
-Pools: `linux-x64`, `linux-x64-2204`, `linux-x64-docker` (biscuits, shared capacity),
+Pools: `linux-x64`, `linux-x64-2204`, `linux-x64-docker` (one Linux host, shared capacity),
 `windows-x64`, `windows-x64-fast` (long jobs: only the fast Windows host, label
 `denext-windows-x64-fast`; it shares `windows-x64`'s slots, and when that host is busy the job
 goes to GitHub, never to the slow host), `windows-arm64`, `macos-arm64`, `macos-x64`, `linux-arm64` (Linux arm64
-containers on the Mac mini, variable `RUNNER_LINUX_ARM64`, label `denext-linux-arm64`; overflow `ubuntu-24.04-arm`, so a job
+containers on the Mac host, variable `RUNNER_LINUX_ARM64`, label `denext-linux-arm64`; overflow `ubuntu-24.04-arm`, so a job
 that needs GitHub's 22.04 ARM image on overflow writes `key=linux-arm64@ubuntu-22.04-arm`), `linux-arm64-desktop` (the Pi; pinned
 jobs only). See `pick_runners.py` for the full rules; tests: `python3 -I pick_runners_test.py`.
 
