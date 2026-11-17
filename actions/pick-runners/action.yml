@@ -10,7 +10,7 @@ inputs:
       (pinned to our hardware) or `key=~other` (same runner as `other`); a memory need goes after
       the image and before `!`: `key=pool@image+16g!` (a job its pool cannot hold takes its image). Pools: linux-x64,
       linux-x64-2204, linux-x64-docker, windows-x64, windows-x64-fast (long jobs: the fast host only),
-      windows-arm64, macos-arm64, macos-x64, linux-arm64 (the Mac mini's Linux arm64 containers;
+      windows-arm64, macos-arm64, macos-x64, linux-arm64 (the Mac host's Linux arm64 containers;
       overflow ubuntu-24.04-arm, or the job's own @ubuntu-22.04-arm), linux-arm64-desktop.
     required: true
   vars:

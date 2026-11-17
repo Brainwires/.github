@@ -83,19 +83,19 @@ import urllib.request
 # that image; naming our label (a bare label, or a JSON array such as
 # ["self-hosted","denext-windows-x64"]), its jobs take our pool while it has room.
 POOLS = {
-    "linux-x64": ("RUNNER_LINUX_X64", "denext-linux-x64", "ubuntu-latest", "biscuits", False),
-    "linux-x64-2204": ("RUNNER_LINUX_X64_2204", "denext-linux-x64-2204", "ubuntu-22.04", "biscuits", False),
-    "linux-x64-docker": ("RUNNER_LINUX_X64_DOCKER", "denext-linux-x64-docker", "ubuntu-latest", "biscuits", False),
+    "linux-x64": ("RUNNER_LINUX_X64", "denext-linux-x64", "ubuntu-latest", "linux-host", False),
+    "linux-x64-2204": ("RUNNER_LINUX_X64_2204", "denext-linux-x64-2204", "ubuntu-22.04", "linux-host", False),
+    "linux-x64-docker": ("RUNNER_LINUX_X64_DOCKER", "denext-linux-x64-docker", "ubuntu-latest", "linux-host", False),
     "windows-x64": ("RUNNER_WINDOWS_X64", "denext-windows-x64", "windows-latest", None, False),
-    # The FAST Windows x64 host only (win-x64, the MacBook VM): for long jobs. The label is an
-    # extra label win-x64's runners carry beside denext-windows-x64; brain (win-x64-brain, an
+    # The FAST Windows x64 host only (win-x64, a Windows VM): for long jobs. The label is an
+    # extra label win-x64's runners carry beside denext-windows-x64; the second Windows host (win-x64-brain, an
     # i3 2C/4T) serves only the shared label and runs a 65-72 min job in 80-95 min. Switched by
     # RUNNER_WINDOWS_X64; its slot is one of windows-x64's (SUBPOOL_OF).
     "windows-x64-fast": ("RUNNER_WINDOWS_X64", "denext-windows-x64-fast", "windows-latest", None, False),
     "windows-arm64": ("RUNNER_WINDOWS_ARM", "denext-windows-arm64", "windows-11-arm", None, False),
     "macos-arm64": ("RUNNER_MACOS_ARM", "denext-macos-arm64", "macos-latest", None, True),
     "macos-x64": ("RUNNER_MACOS_X64", "denext-macos-x64", "macos-15-intel", None, True),
-    # Linux arm64 job containers on the Mac mini (Docker Desktop; Ubuntu 22.04 image, so a job that needs
+    # Linux arm64 job containers on the Mac host (Docker Desktop; Ubuntu 22.04 image, so a job that needs
     # GitHub's 22.04 ARM image on overflow names it: `key=linux-arm64@ubuntu-22.04-arm`).
     "linux-arm64": ("RUNNER_LINUX_ARM64", "denext-linux-arm64", "ubuntu-24.04-arm", None, False),
     # The Pi (GNOME session on arm64): no GitHub equivalent; pinned jobs only.
@@ -126,9 +126,9 @@ POOL_MEM_GB = {
     "linux-arm64-desktop": 10,
 }
 
-# A shared group's capacity variable (biscuits' three labels are one 8-core
+# A shared group's capacity variable (the Linux host's three labels are one 8-core
 # host's job containers).
-GROUP_SLOTS_VAR = {"biscuits": "RUNNER_LINUX_X64_SHARED_SLOTS"}
+GROUP_SLOTS_VAR = {"linux-host": "RUNNER_LINUX_X64_SHARED_SLOTS"}
 
 HEALTH_MAX_AGE = 10 * 60  # seconds: an older DENEXT_POOL_HEALTH is stale
 # GitHub fixes a run's `vars` (so DENEXT_POOL_HEALTH) when the run (attempt) starts, not when a job

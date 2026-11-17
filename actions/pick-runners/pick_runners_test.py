@@ -235,7 +235,7 @@ class BatchTest(unittest.TestCase):
         plan, _, _, _ = run(env("a=macos-arm64 b=macos-arm64 c=macos-arm64 d=macos-arm64", h, RUNNER_MACOS_ARM=MAC))
         self.assertEqual(plan, {"a": ours(MAC), "b": ours(MAC), "c": "macos-latest", "d": "macos-latest"})
 
-    def test_biscuits_share_one_capacity(self):
+    def test_linux_host_labels_share_one_capacity(self):
         h = health({"denext-linux-x64": entry(3, busy=1), "denext-linux-x64-docker": entry(1, busy=1),
                     "denext-linux-x64-2204": entry(3, busy=0)})
         plan, _, _, _ = run(env("a=linux-x64-2204 b=linux-x64 c=linux-x64", h, RUNNER_LINUX_X64=LINUX,
@@ -281,7 +281,7 @@ class BatchTest(unittest.TestCase):
 
 
 class FastHostTest(unittest.TestCase):
-    """Long Windows jobs ask for the fast host's own label; brain never takes them."""
+    """Long Windows jobs ask for the fast host's own label; the second Windows host never takes them."""
 
     def h(self, win_busy, fast_busy, brain_ok=True):
         return health({"denext-windows-x64": entry(2, busy=win_busy + (1 if brain_ok and win_busy > fast_busy else 0),
@@ -295,7 +295,7 @@ class FastHostTest(unittest.TestCase):
     def test_long_job_overflows_when_only_brain_is_free(self):
         h = health({"denext-windows-x64": entry(2, busy=1), "denext-windows-x64-fast": entry(1, busy=1)})
         plan, rows, _, _ = run(env("t=windows-x64-fast s=windows-x64", h, RUNNER_WINDOWS_X64=WIN))
-        self.assertEqual(plan, {"t": "windows-latest", "s": ours(WIN)})  # the short job takes brain
+        self.assertEqual(plan, {"t": "windows-latest", "s": ours(WIN)})  # the short job takes the second host
 
     def test_long_job_uses_up_the_shared_label_slot(self):
         h = health({"denext-windows-x64": entry(2, busy=1), "denext-windows-x64-fast": entry(1, busy=0)})
