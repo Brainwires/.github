@@ -48,9 +48,10 @@ def env(jobs, health_value=None, **variables):
 class FakeApi:
     """GET answers by path prefix; records every call."""
 
-    def __init__(self, runs=(), jobs=None, runners=(), attempt_jobs=(), fail=False):
+    def __init__(self, runs=(), jobs=None, runners=(), attempt_jobs=(), fail=False, run=None):
         self.runs, self.jobs, self.runners = list(runs), jobs or {}, list(runners)
         self.attempt_jobs, self.fail, self.calls = list(attempt_jobs), fail, []
+        self.run = run  # this run's own object (GET /actions/runs/<id>), or None: not answered
 
     def __call__(self, path):
         self.calls.append(path)
@@ -67,6 +68,8 @@ class FakeApi:
             return {"jobs": self.jobs.get(rid, [])}
         if p.endswith("/actions/runners"):
             return {"runners": self.runners}
+        if "/actions/runs/" in p and p.rsplit("/", 1)[1].isdigit() and self.run is not None:
+            return self.run
         raise AssertionError(path)
 
 
@@ -376,6 +379,78 @@ class MacosCapTest(unittest.TestCase):
         plan, _, _, warnings = run(e, get=api)
         self.assertEqual(plan["a"], ours(MAC))
         self.assertTrue(any("wait for our pool" in w for w in warnings))
+
+
+def iso(t):
+    return __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime(t))
+
+
+class AgedHealthTest(unittest.TestCase):
+    """GitHub fixes `vars` when the run starts: a picker 30 min into the run reads a 30-min-old value."""
+
+    def test_aged_value_keeps_the_pool_states_and_slots(self):
+        # fresh (6 min) when the run started 25 min ago; 31 min old now: two free slots, not one
+        h = health({"denext-macos-arm64": entry(2)}, age=31 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 25 * 60), "created_at": iso(NOW - 25 * 60)})
+        plan, _, free, warnings = run(env("a=macos-arm64 b=macos-arm64 c=macos-arm64", h, RUNNER_MACOS_ARM=MAC),
+                                      get=api)
+        self.assertEqual(free["denext-macos-arm64"], 2)
+        self.assertEqual(plan, {"a": ours(MAC), "b": ours(MAC), "c": "macos-latest"})
+        self.assertTrue(any("31 min old" in w and "25 min later" in w for w in warnings), warnings)
+        self.assertFalse(any("older than 10 min" in w for w in warnings))
+
+    def test_aged_value_still_blocks_an_unhealthy_pool(self):
+        # the stale path would send one job to it; the aged value knows it was down
+        h = health({"denext-windows-x64": dict(entry(2, ok=False), reason="guest unreachable")}, age=30 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 28 * 60)})
+        plan, rows, _, _ = run(env("a=windows-x64", h, RUNNER_WINDOWS_X64=WIN), get=api)
+        self.assertEqual(plan["a"], "windows-latest")
+        self.assertIn("guest unreachable", rows[0][3])
+
+    def test_aged_value_counts_the_published_load_without_a_runner_token(self):
+        h = health({"denext-macos-arm64": entry(2, busy=2)}, age=20 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        plan, _, free, _ = run(env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC), get=api)
+        self.assertEqual(free["denext-macos-arm64"], 0)
+        self.assertEqual(plan["a"], "macos-latest")
+
+    def test_aged_value_with_the_runner_token_counts_busy_runners_live(self):
+        h = health({"denext-macos-arm64": entry(2, busy=2, queued=3)}, age=20 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        runners = FakeApi(runners=[{"status": "online", "busy": True, "labels": [{"name": "denext-macos-arm64"}]}])
+        e = env("a=macos-arm64 b=macos-arm64", h, RUNNER_MACOS_ARM=MAC)
+        plan, _, free, _ = run(e, get=api, runner_get=runners)
+        self.assertEqual(free["denext-macos-arm64"], 1)  # 2 slots, 1 busy now (the published 2 + 3 queued are gone)
+        self.assertEqual(plan, {"a": ours(MAC), "b": "macos-latest"})
+
+    def test_a_value_already_stale_when_the_run_started_is_stale(self):
+        # the watchdog was not publishing: 40 min old, the run started 20 min ago
+        h = health({"denext-windows-x64": entry(9)}, age=40 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 20 * 60)})
+        plan, _, _, warnings = run(env("a=windows-x64 b=windows-x64", h, RUNNER_WINDOWS_X64=WIN), get=api)
+        self.assertEqual(plan, {"a": ours(WIN), "b": "windows-latest"})
+        self.assertTrue(any("older than 10 min" in w for w in warnings))
+
+    def test_too_old_or_unknown_start_is_stale(self):
+        h = health({"denext-windows-x64": entry(9)}, age=pr.AGED_MAX_AGE + 1)
+        self.assertIsNone(pr.aged_health(h, NOW, NOW - pr.AGED_MAX_AGE))
+        h = health({"denext-windows-x64": entry(9)}, age=30 * 60)
+        self.assertIsNone(pr.aged_health(h, NOW, None))
+        plan, _, _, _ = run(env("a=windows-x64 b=windows-x64", h, RUNNER_WINDOWS_X64=WIN), get=FakeApi())
+        self.assertEqual(plan, {"a": ours(WIN), "b": "windows-latest"})  # the run lookup failed: stale path
+
+    def test_aged_value_ignores_its_github_queue(self):
+        v = json.loads(health({"denext-macos-arm64": entry(1, busy=1)}, age=20 * 60))
+        v["github"] = {"macos": {"queued": 5, "oldest_at": NOW - 30 * 60}}
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        plan, _, _, _ = run(env("a=macos-arm64", json.dumps(v), RUNNER_MACOS_ARM=MAC), get=api)
+        self.assertEqual(plan["a"], "macos-latest")  # no "waits": that queue is 20 min old
+
+    def test_the_deno_run_of_2026_11_17(self):
+        # value checked 02:42:12Z, run started 02:48:33Z, the macos-15 leg's picker at 03:15:01Z
+        h = json.dumps({"v": 1, "checked_at": 1794883332, "pools": {"denext-macos-arm64": entry(2)}})
+        self.assertIsNone(pr.fresh_health(h, 1794885301))
+        self.assertIsNotNone(pr.aged_health(h, 1794885301, 1794883713))
 
 
 class RerunTest(unittest.TestCase):
