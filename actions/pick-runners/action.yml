@@ -22,6 +22,11 @@ inputs:
   runner-token:
     description: "Optional token that may list the org's self-hosted runners (RUNNER_STATUS_TOKEN)."
     default: ""
+  health-token:
+    description: >-
+      Optional token with the organization "Variables: read" permission. GitHub fixes a run's `vars`
+      when the run starts, so a picker later in the run reads DENEXT_POOL_HEALTH live with it.
+    default: ""
   macos-cap:
     description: "The most macOS jobs this run sends to GitHub (GitHub runs ~5 for the whole org)."
     default: "3"
@@ -59,6 +64,7 @@ runs:
         PICK_DRY_RUN: ${{ inputs.dry-run }}
         PICK_SETTLE: ${{ inputs.settle }}
         PICK_RUNNER_TOKEN: ${{ inputs.runner-token }}
+        PICK_HEALTH_TOKEN: ${{ inputs.health-token }}
         GITHUB_TOKEN: ${{ inputs.token }}
       # The script never fails and prints its own fallback; if python itself cannot start, the
       # outputs stay empty and each job's `|| '<image>'` fallback takes GitHub's image.

@@ -147,6 +147,13 @@ GITHUB_IMAGE = re.compile(r"^(ubuntu|windows|macos)-[0-9a-z.-]+$")
 GITHUB_FAMILIES = ("macos", "windows", "ubuntu")
 WAIT_DEPTH = 2  # jobs of one run that may wait for one busy pool of ours (2026-11-16: 6 macOS jobs queued behind 2 slots while GitHub emptied); past it they overflow
 GITHUB_SATURATED_AFTER = 180  # seconds a family's oldest queued GitHub job waits before it is saturated
+# A family is saturated only with this many jobs queued too (the watchdog applied this filter to `github`;
+# it publishes the unfiltered queue as `hosted`, so the rule lives here).
+GITHUB_SATURATED_MIN_QUEUED = 3
+# GitHub runs about this many macOS jobs at once for the whole org (PICK_MACOS_CONCURRENCY).
+MACOS_CONCURRENCY = 5
+# The fleet's per-label advice (from jev's votes and GitHub's queue) counts at this probability or more.
+ADVICE_MIN_P = 0.8
 
 
 def _dumps(value):
@@ -310,7 +317,10 @@ def github_saturated(value, now):
     malformed entry (no count, no `oldest_at`): not saturated (as before the
     field existed)."""
     health = _fresh(value, now)
-    github = health.get("github") if health else None
+    hosted = health.get("hosted") if health else None
+    # `hosted` is unfiltered: the minimum count applies here; `github` is published already filtered.
+    min_queued = GITHUB_SATURATED_MIN_QUEUED if isinstance(hosted, dict) else 1
+    github = hosted if isinstance(hosted, dict) else (health.get("github") if health else None)
     if not isinstance(github, dict):
         return {}
     out = {}
@@ -319,11 +329,84 @@ def github_saturated(value, now):
         if not isinstance(e, dict):
             continue
         queued, oldest = _n(e.get("queued")), _n(e.get("oldest_at"))
-        if not queued or not oldest:
+        if not queued or not oldest or queued < min_queued:
             continue
         if now - oldest >= GITHUB_SATURATED_AFTER:
             out[family] = int(now - oldest)
     return out
+
+
+def hosted_state(value, now):
+    """{family: {"queued": n, "oldest_age": s or None, "running": n or None}} of
+    GitHub's images, from the FRESH health's `hosted` only (every family,
+    unfiltered, so a family it leaves out has nothing queued; `running` when the
+    fleet can see it). {} when stale or absent: the older `github` key lists only
+    saturated-looking families and never changes the macOS budget."""
+    health = _fresh(value, now)
+    src = health.get("hosted") if health else None
+    if not isinstance(src, dict):
+        return {}
+    out = {}
+    for family in GITHUB_FAMILIES:
+        e = src.get(family)
+        if not isinstance(e, dict):
+            out[family] = {"queued": 0, "oldest_age": None, "running": None}
+            continue
+        queued, oldest = _n(e.get("queued")), _n(e.get("oldest_at"))
+        if queued is None:
+            continue
+        out[family] = {
+            "queued": queued,
+            "oldest_age": int(now - oldest) if oldest and queued else None,
+            "running": _n(e.get("running")),
+        }
+    return out
+
+
+def macos_budget(cap, state, overflow_advised):
+    """How many macOS jobs this run may send to GitHub. No fresh view of GitHub's
+    macOS queue: PICK_MACOS_CAP, as before. With one: what GitHub has room for,
+    MACOS_CONCURRENCY minus its running and queued jobs when the fleet sees the
+    running ones; else the cap minus the queued ones, or (nothing queued and the
+    fleet advising overflow for a macOS label) MACOS_CONCURRENCY. Saturation is
+    `github_saturated`'s (those jobs wait whatever the budget)."""
+    s = state.get("macos")
+    if s is None:
+        return cap
+    if s["running"] is not None:
+        return max(0, MACOS_CONCURRENCY - s["running"] - s["queued"])
+    if s["queued"] == 0 and overflow_advised:
+        return max(cap, MACOS_CONCURRENCY)
+    return max(0, cap - s["queued"])
+
+
+def advice_of(value, now):
+    """{label: (route, p)} of the FRESH health's `advice`: `overflow` (GitHub's
+    image now) or `wait` (our busy pool frees sooner), at ADVICE_MIN_P or more.
+    The fleet publishes it only for choices its rules allow (never `overflow` to a
+    saturated family). {} when stale, absent or malformed."""
+    health = _fresh(value, now)
+    adv = health.get("advice") if health else None
+    if not isinstance(adv, dict):
+        return {}
+    out = {}
+    for label, e in adv.items():
+        if not isinstance(e, dict) or e.get("route") not in ("overflow", "wait"):
+            continue
+        p = e.get("p")
+        if isinstance(p, bool) or not isinstance(p, (int, float)) or p < ADVICE_MIN_P:
+            continue
+        out[label] = (e["route"], float(p))
+    return out
+
+
+def live_health(get, org):
+    """The org variable's current value (GET /orgs/<org>/actions/variables/...),
+    for a picker whose `vars` GitHub froze at the run's start. Needs a token with
+    the organization "Variables: read" permission (`health-token`)."""
+    v = get(f"/orgs/{org}/actions/variables/DENEXT_POOL_HEALTH")
+    value = v.get("value") if isinstance(v, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def image_family(image):
@@ -466,7 +549,8 @@ def free_slots(pools_in_use, health_pools, variables, counts, stalled):
 # ---- the decision ------------------------------------------------------------
 
 
-def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None):
+def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None,
+             advice=None, pool_waiting=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their
     slots whatever is free), then the rest in priority order: a job that needs
     more memory than its pool holds takes its image; else our pool while it and
@@ -474,8 +558,14 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
     or a job whose image family is saturated on GitHub (`saturated`, from
     `github_saturated`), waits for our pool instead, but only for a pool that is
     merely busy (no `notes` entry). `mem` is {pool name: GB} (`mem_capacity`;
-    POOL_MEM_GB for a pool it leaves out). Followers copy their target."""
+    POOL_MEM_GB for a pool it leaves out). Followers copy their target.
+
+    `advice` ({label: (route, p)}, `advice_of`): `wait` makes a job wait for its
+    merely busy pool as the cap and saturation do. `pool_waiting` ({label:
+    (already, depth)}): jobs of ANY run already waiting on the label, and how many
+    may; a job waits only while fewer do (None: WAIT_DEPTH per run, as before)."""
     free = dict(free)
+    advice = advice or {}
     groups = dict(groups)
     notes, saturated = notes or {}, saturated or {}
     plan, rows = {}, {}
@@ -508,7 +598,21 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             why += f"; needs {job['mem']} GB, {p.label} holds {mem_of(p)} (may not fit)"
         rows[job["key"]] = (p.name, "ours (pinned)", why)
     hosted_macos = 0
-    waits = {}  # label -> jobs of this run that wait for it (at most WAIT_DEPTH)
+    waits = {}  # label -> jobs of this run that wait for it
+
+    def may_wait(p):
+        if notes.get(p.label):
+            return False  # never on an unhealthy, paused, unlisted or stalled pool
+        if pool_waiting is None or p.label not in pool_waiting:
+            return waits.get(p.label, 0) < WAIT_DEPTH
+        already, depth = pool_waiting[p.label]
+        return already + waits.get(p.label, 0) < depth
+
+    def depth_note(p):
+        if pool_waiting is None or p.label not in pool_waiting:
+            return f" ({WAIT_DEPTH} job(s) of this run already wait for it)"
+        already, depth = pool_waiting[p.label]
+        return f" ({already + waits.get(p.label, 0)} job(s) of all runs already wait for it, at most {depth})"
     for job in jobs:
         if job["follow"] or job["pinned"]:
             continue
@@ -532,7 +636,7 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
         ):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
-        elif p.macos and hosted_macos >= macos_cap and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
+        elif p.macos and hosted_macos >= macos_cap and may_wait(p):
             waits[p.label] = waits.get(p.label, 0) + 1
             # GitHub's macOS share is spent: wait for our pool, but only for a pool that is
             # merely busy (never one that is unhealthy, paused, unlisted or stalled).
@@ -541,7 +645,7 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
                 "ours (waits)",
                 f"no free slot, but this run already sent {hosted_macos} macOS job(s) to GitHub (cap {macos_cap})",
             )
-        elif image_family(image) in saturated and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
+        elif image_family(image) in saturated and may_wait(p):
             waits[p.label] = waits.get(p.label, 0) + 1
             # GitHub has had a job of this family queued for minutes: our busy pool frees sooner.
             # Not counted against the macOS cap (the job does not go to GitHub).
@@ -553,14 +657,23 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
                 f"{busy}, but GitHub's {family} images have had a job queued for"
                 f" {saturated[family] // 60} min (saturated)",
             )
+        elif advice.get(p.label, ("",))[0] == "wait" and may_wait(p):
+            waits[p.label] = waits.get(p.label, 0) + 1
+            plan[key], rows[key] = p.runs_on, (
+                p.name,
+                "ours (waits)",
+                f"no free slot, but the fleet advises waiting: {p.label} frees sooner (p={advice[p.label][1]:.2f})",
+            )
         else:
             if p.macos:
                 hosted_macos += 1
             why = notes.get(p.label) or (
                 f"no free slot on {p.label}" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full"
             )
-            if waits.get(p.label, 0) >= WAIT_DEPTH:
-                why += f" ({WAIT_DEPTH} job(s) of this run already wait for it)"
+            if not notes.get(p.label) and not may_wait(p):
+                why += depth_note(p)
+            elif advice.get(p.label, ("",))[0] == "overflow":
+                why += f" (the fleet advises overflow, p={advice[p.label][1]:.2f})"
             plan[key], rows[key] = image, (p.name, "GitHub", why)
     for job in jobs:
         if job["follow"]:
@@ -788,7 +901,7 @@ LAST = {"blocked": [], "saturated": {}}  # side output of the latest pick() (kep
 
 
 def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=time.sleep,
-         clock=time.monotonic):
+         clock=time.monotonic, health_get=None):
     """(plan, rows, free) for the environment `env` (see the module docstring)."""
     LAST["blocked"], LAST["saturated"] = [], {}
     now = time.time() if now is None else now
@@ -810,6 +923,14 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         macos_cap = DEFAULT_MACOS_CAP
     in_use = [p for p in pools.values() if p.mode == "ours"]
     pinned_only = all(j["pinned"] or j["follow"] for j in jobs)
+    if health_get is not None and not fork_pr and in_use and fresh_health(variables.get("DENEXT_POOL_HEALTH"), now) is None:
+        # GitHub froze `vars` at the run's start: read the variable as it is now.
+        try:
+            value = live_health(health_get, env.get("GITHUB_REPOSITORY", "").split("/")[0])
+            if value is not None and fresh_health(value, now) is not None:
+                variables["DENEXT_POOL_HEALTH"] = value
+        except Exception as e:  # advisory: the run's own value below
+            warn(f"pick-runners: reading DENEXT_POOL_HEALTH live failed ({e}); using the run's value")
     health = fresh_health(variables.get("DENEXT_POOL_HEALTH"), now)
     saturated = github_saturated(variables.get("DENEXT_POOL_HEALTH"), now)
     LAST["saturated"] = saturated
@@ -886,13 +1007,37 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
                       for l, e in health.items()}
         free, groups = free_slots(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
-        plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem)
+        advice, pool_waiting = {}, None
+        if health is not None and not aged:
+            value = variables.get("DENEXT_POOL_HEALTH")
+            advice = {l: a for l, a in advice_of(value, now).items() if l in {p.label for p in in_use}}
+            overflow_mac = any(a[0] == "overflow" and pools_by_label(in_use).get(l) and pools_by_label(in_use)[l].macos
+                               for l, a in advice.items())
+            if macos_cap:  # 0 after a starved GitHub macOS attempt stays 0
+                budget = macos_budget(macos_cap, hosted_state(value, now), overflow_mac)
+                if budget != macos_cap:
+                    warn(f"pick-runners: macOS budget {budget} (cap {macos_cap}) from GitHub's macOS queue")
+                macos_cap = budget
+            # Waits are counted per POOL across runs: the jobs queued on a label beyond its slots wait already.
+            pool_waiting = {}
+            for p in in_use:
+                e = health.get(p.label)
+                if isinstance(e, dict):
+                    cap = _n(e.get("healthy_slots"))
+                    cap = cap if cap is not None else (_n(e.get("slots")) or 0)
+                    pool_waiting[p.label] = (max(0, taken_slots(p.label, e, counts) - cap), max(1, cap))
+        plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
+                              advice, pool_waiting)
         LAST["blocked"] = sorted(l for l, n in notes.items() if n)
         return plan, rows, free
     except Exception as e:  # never fail the run
         warn(f"pick-runners: {e}; every job but the pinned ones takes its GitHub image")
         plan = fallback_plan(jobs, pools, False)
         return plan, [(k, "?", "GitHub", "picker error", v) for k, v in plan.items()], {}
+
+
+def pools_by_label(in_use):
+    return {p.label: p for p in in_use}
 
 
 def table(rows, free, saturated=None):
@@ -913,15 +1058,17 @@ def main(argv):
     env = dict(os.environ)
     dry = env.get("PICK_DRY_RUN") == "true" or "--dry-run" in argv
     warn = lambda m: print(f"::warning::{m}", file=sys.stderr)
-    get = runner_get = None
+    get = runner_get = health_get = None
     if not dry:
         base = env.get("GITHUB_API_URL") or "https://api.github.com"
         if env.get("GITHUB_TOKEN"):
             get = api(base, env["GITHUB_TOKEN"])
         if env.get("PICK_RUNNER_TOKEN"):
             runner_get = api(base, env["PICK_RUNNER_TOKEN"])
+        if env.get("PICK_HEALTH_TOKEN"):
+            health_get = api(base, env["PICK_HEALTH_TOKEN"])
     try:
-        plan, rows, free = pick(env, get, runner_get, warn)
+        plan, rows, free = pick(env, get, runner_get, warn, health_get=health_get)
     except Exception as e:  # pick() catches its own; this is the last guard
         warn(f"pick-runners: {e}")
         plan, rows, free = {}, [], {}

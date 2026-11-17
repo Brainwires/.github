@@ -453,6 +453,127 @@ class AgedHealthTest(unittest.TestCase):
         self.assertIsNotNone(pr.aged_health(h, 1794885301, 1794883713))
 
 
+def health_adv(pools, hosted=None, advice=None, age=60):
+    v = {"v": 1, "checked_at": NOW - age, "pools": pools}
+    if hosted is not None:
+        v["hosted"] = hosted
+    if advice is not None:
+        v["advice"] = advice
+    return json.dumps(v)
+
+
+MAC4 = "a=macos-arm64 b=macos-arm64 c=macos-arm64 d=macos-arm64 e=macos-arm64 f=macos-arm64"
+
+
+class PickTimeAdviceTest(unittest.TestCase):
+    """J3 at pick time: GitHub's queue and jev's votes reach the picker through the fleet's health."""
+
+    def busy_mac(self, queued=0):
+        return {"denext-macos-arm64": entry(2, busy=2, queued=queued)}
+
+    def test_macos_budget_from_gitHubs_running_and_queued_jobs(self):
+        h = health_adv(self.busy_mac(), {"macos": {"queued": 0, "oldest_at": None, "running": 1}})
+        plan, rows, _, warnings = run(env(MAC4, h, RUNNER_MACOS_ARM=MAC))
+        # 5 - 1 running: four go to GitHub at once; the per-pool waits take the rest
+        self.assertEqual([plan[k] for k in "abcd"], ["macos-latest"] * 4)
+        self.assertEqual([r[2] for r in rows[4:]], ["ours (waits)", "ours (waits)"])
+        self.assertTrue(any("macOS budget 4 (cap 3)" in w for w in warnings), warnings)
+
+    def test_a_busy_gitHub_lowers_the_budget(self):
+        h = health_adv(self.busy_mac(), {"macos": {"queued": 2, "oldest_at": NOW - 60, "running": 3}})
+        plan, _, _, _ = run(env("a=macos-arm64 b=macos-arm64", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan, {"a": ours(MAC), "b": ours(MAC)})  # GitHub has no room: both wait
+
+    def test_running_unknown_idle_queue_and_overflow_advice(self):
+        hosted = {"macos": {"queued": 0, "oldest_at": None}}
+        h = health_adv(self.busy_mac(), hosted, {"denext-macos-arm64": {"route": "overflow", "p": 0.9}})
+        plan, rows, _, _ = run(env(MAC4, h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual([plan[k] for k in "abcde"], ["macos-latest"] * 5)
+        self.assertIn("advises overflow", rows[0][3])
+        # without the advice: the cap of 3, as before
+        plan, _, _, _ = run(env(MAC4, health_adv(self.busy_mac(), hosted), RUNNER_MACOS_ARM=MAC))
+        self.assertEqual([plan[k] for k in "abc"], ["macos-latest"] * 3)
+        self.assertEqual(plan["d"], ours(MAC))
+
+    def test_hosted_needs_three_queued_to_be_saturated(self):
+        h = health_adv(self.busy_mac(), {"macos": {"queued": 2, "oldest_at": NOW - 900}})
+        plan, _, _, _ = run(env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan["a"], "macos-latest")
+        h = health_adv(self.busy_mac(), {"macos": {"queued": 3, "oldest_at": NOW - 900}})
+        self.assertEqual(pr.github_saturated(h, NOW), {"macos": 900})
+
+    def test_wait_advice_keeps_a_job_for_our_busy_pool(self):
+        h = health_adv(self.busy_mac(), {}, {"denext-macos-arm64": {"route": "wait", "p": 0.85}})
+        plan, rows, _, _ = run(env("a=macos-x64 b=macos-arm64", h, RUNNER_MACOS_ARM=MAC,
+                                   RUNNER_MACOS_X64=MACX))
+        self.assertEqual(plan["b"], ours(MAC))
+        self.assertIn("advises waiting", rows[1][3])
+
+    def test_weak_or_unknown_advice_is_ignored(self):
+        for adv in ({"route": "wait", "p": 0.79}, {"route": "maybe", "p": 1}, {"route": "wait"}, "wait"):
+            h = health_adv({"denext-windows-x64": entry(1, busy=1)}, {}, {"denext-windows-x64": adv})
+            self.assertEqual(run(env("a=windows-x64", h, RUNNER_WINDOWS_X64=WIN))[0]["a"], "windows-latest", adv)
+
+    def test_wait_advice_never_strands_a_job_on_an_unhealthy_pool(self):
+        h = health_adv({"denext-windows-x64": dict(entry(1), ok=False)}, {},
+                       {"denext-windows-x64": {"route": "wait", "p": 0.99}})
+        self.assertEqual(run(env("a=windows-x64", h, RUNNER_WINDOWS_X64=WIN))[0]["a"], "windows-latest")
+
+    def test_waits_are_counted_per_pool_across_runs(self):
+        # another run's job already waits on the 2-slot pool (busy 2, 3 queued): one more may wait, not two
+        h = health_adv({"denext-windows-x64": entry(2, busy=2, queued=3)}, {},
+                       {"denext-windows-x64": {"route": "wait", "p": 0.9}})
+        plan, rows, _, _ = run(env("a=windows-x64 b=windows-x64", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": ours(WIN), "b": "windows-latest"})
+        self.assertIn("2 job(s) of all runs already wait for it, at most 2", rows[1][3])
+
+    def test_an_aged_value_carries_no_advice_nor_budget(self):
+        h = health_adv(self.busy_mac(), {"macos": {"queued": 0, "oldest_at": None, "running": 0}},
+                       {"denext-macos-arm64": {"route": "wait", "p": 0.99}}, age=30 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 25 * 60)})
+        plan, rows, _, _ = run(env("a=macos-arm64 b=macos-arm64 c=macos-arm64 d=macos-arm64", h,
+                                   RUNNER_MACOS_ARM=MAC), get=api)
+        self.assertEqual([plan[k] for k in "abc"], ["macos-latest"] * 3)  # the cap of 3, no advice
+        self.assertNotIn("advises", " ".join(r[3] for r in rows))
+
+    def test_a_starved_gitHub_macos_attempt_keeps_the_cap_at_zero(self):
+        h = health_adv(self.busy_mac(), {"macos": {"queued": 0, "oldest_at": None, "running": 0}})
+        e = env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC)
+        e["GITHUB_RUN_ATTEMPT"] = "2"
+        api = FakeApi(attempt_jobs=[{"conclusion": "cancelled", "runner_name": None, "labels": ["macos-latest"]}])
+        self.assertEqual(run(e, get=api)[0]["a"], ours(MAC))
+
+    def test_health_token_reads_the_live_value(self):
+        frozen = health({"denext-macos-arm64": entry(2)}, age=40 * 60)
+        live = health({"denext-macos-arm64": entry(2)}, age=60)
+        e = env("a=macos-arm64 b=macos-arm64", frozen, RUNNER_MACOS_ARM=MAC)
+        calls = []
+
+        def hget(path):
+            calls.append(path)
+            return {"name": "DENEXT_POOL_HEALTH", "value": live}
+        plan, _, free, warnings = run_h(e, hget)
+        self.assertEqual(calls, ["/orgs/Brainwires/actions/variables/DENEXT_POOL_HEALTH"])
+        self.assertEqual(free["denext-macos-arm64"], 2)
+        self.assertFalse(any("older than 10 min" in w or "min old" in w for w in warnings), warnings)
+
+        def broken(path):
+            raise OSError("HTTP 403")
+        _, _, _, warnings = run_h(e, broken)
+        self.assertTrue(any("reading DENEXT_POOL_HEALTH live failed" in w for w in warnings))
+        self.assertTrue(any("older than 10 min" in w for w in warnings))
+
+    def test_no_live_read_while_the_runs_value_is_fresh(self):
+        e = env("a=macos-arm64", health({"denext-macos-arm64": entry(2)}), RUNNER_MACOS_ARM=MAC)
+        self.assertEqual(run_h(e, lambda p: self.fail("called"))[0]["a"], ours(MAC))
+
+
+def run_h(e, health_get, now=NOW):
+    warnings = []
+    plan, rows, free = pr.pick(e, None, None, warnings.append, now, health_get=health_get)
+    return plan, rows, free, warnings
+
+
 class RerunTest(unittest.TestCase):
     def test_rerun_after_our_pool_stalled(self):
         h = health({"denext-windows-x64": entry(2)})
