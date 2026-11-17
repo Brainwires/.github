@@ -326,6 +326,18 @@ def github_saturated(value, now):
     return out
 
 
+def github_off(value, now):
+    """The GitHub image families ops turned off (the fresh health's `github_off`, set from the watchdog's
+    `github-off` switch): a job of one never goes to GitHub, it waits for our pool however long and however
+    many wait (2026-11-17, "use only our runners": GitHub's macOS arm64 capacity dropped queued jobs all day
+    while WAIT_DEPTH still overflowed the third job of a run). Stale or missing health: none off."""
+    health = _fresh(value, now)
+    off = health.get("github_off") if health else None
+    if not isinstance(off, list):
+        return set()
+    return {f for f in off if f in GITHUB_FAMILIES}
+
+
 def image_family(image):
     """The GitHub image family of a runs-on image (`macos-15` -> macos), or None
     for anything that is not one of GITHUB_FAMILIES."""
@@ -466,7 +478,7 @@ def free_slots(pools_in_use, health_pools, variables, counts, stalled):
 # ---- the decision ------------------------------------------------------------
 
 
-def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None):
+def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their
     slots whatever is free), then the rest in priority order: a job that needs
     more memory than its pool holds takes its image; else our pool while it and
@@ -532,6 +544,9 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
         ):
             take(p)
             plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
+        elif image_family(image) in (off or set()):
+            # ops turned GitHub's family off: wait for our pool, no depth limit, never GitHub
+            plan[key], rows[key] = p.runs_on, (p.name, "ours (waits)", f"GitHub {image_family(image)} is off (ops switch)")
         elif p.macos and hosted_macos >= macos_cap and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
             waits[p.label] = waits.get(p.label, 0) + 1
             # GitHub's macOS share is spent: wait for our pool, but only for a pool that is
@@ -886,7 +901,8 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
                       for l, e in health.items()}
         free, groups = free_slots(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
-        plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem)
+        plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
+                              github_off(variables.get("DENEXT_POOL_HEALTH"), now))
         LAST["blocked"] = sorted(l for l, n in notes.items() if n)
         return plan, rows, free
     except Exception as e:  # never fail the run

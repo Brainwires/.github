@@ -713,6 +713,24 @@ class SaturationTest(unittest.TestCase):
         self.assertEqual([r[2] for r in rows], ["ours (waits)", "ours (waits)", "GitHub", "GitHub"])
         self.assertIn("already wait for it", rows[2][3])
 
+    def test_github_off_keeps_every_job_on_our_pool(self):
+        # 2026-11-17 "use only our runners": the ops switch turns a family off; no depth limit.
+        h = json.dumps({"v": 1, "checked_at": NOW - 60, "pools": {"denext-macos-arm64": entry(2, busy=2)},
+                        "github": {}, "github_off": ["macos"]})
+        plan, rows, _, _ = run(env("a=macos-arm64@macos-15 b=macos-arm64@macos-15 c=macos-arm64@macos-15"
+                                   " d=macos-arm64@macos-15 e=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual([plan[k] for k in "abcde"], [ours(MAC)] * 5)
+        self.assertTrue(all(r[2] == "ours (waits)" and "GitHub macos is off" in r[3] for r in rows))
+
+    def test_github_off_ignores_stale_health(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - 11 * 60, "pools": {"denext-macos-arm64": entry(1, busy=1)},
+                        "github": {}, "github_off": ["macos"]})
+        self.assertEqual(pr.github_off(h, NOW), set())
+
+    def test_github_off_ignores_unknown_families(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - 60, "pools": {}, "github_off": ["macos", "nope", 3]})
+        self.assertEqual(pr.github_off(h, NOW), {"macos"})
+
     def test_below_the_threshold_is_not_saturated(self):
         h = health_gh({"denext-macos-arm64": entry(1, busy=1)}, {"macos": {"queued": 3, "oldest_at": NOW - 179}})
         plan, _, _, _ = run(env("a=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
