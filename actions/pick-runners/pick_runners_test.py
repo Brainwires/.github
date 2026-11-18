@@ -722,10 +722,22 @@ class SaturationTest(unittest.TestCase):
         self.assertEqual([plan[k] for k in "abcde"], [ours(MAC)] * 5)
         self.assertTrue(all(r[2] == "ours (waits)" and "GitHub macos is off" in r[3] for r in rows))
 
-    def test_github_off_ignores_stale_health(self):
-        h = json.dumps({"v": 1, "checked_at": NOW - 11 * 60, "pools": {"denext-macos-arm64": entry(1, busy=1)},
-                        "github": {}, "github_off": ["macos"]})
+    def test_github_off_holds_in_a_frozen_health_value(self):
+        # GitHub freezes the variable at run start: a late picker sees it 17 min old (2026-11-17).
+        h = json.dumps({"v": 1, "checked_at": NOW - 17 * 60, "pools": {"denext-macos-arm64": entry(1, busy=1)},
+                        "github": {}, "github_off": ["macos", "windows"]})
+        self.assertEqual(pr.github_off(h, NOW), {"macos", "windows"})
+
+    def test_github_off_expires_after_its_max_age(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - pr.GITHUB_OFF_MAX_AGE - 1, "pools": {},
+                        "github_off": ["macos"]})
         self.assertEqual(pr.github_off(h, NOW), set())
+
+    def test_github_off_applies_with_aged_pool_health(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - 17 * 60,
+                        "pools": {"denext-windows-x64": entry(1, busy=1)}, "github": {}, "github_off": ["windows"]})
+        plan, rows, _, _ = run(env("a=windows-x64@windows-2022 b=windows-x64@windows-2022", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual([plan[k] for k in "ab"], [ours(WIN)] * 2)
 
     def test_github_off_ignores_unknown_families(self):
         h = json.dumps({"v": 1, "checked_at": NOW - 60, "pools": {}, "github_off": ["macos", "nope", 3]})

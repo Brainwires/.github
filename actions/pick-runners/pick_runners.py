@@ -145,6 +145,7 @@ MAX_PAGES = 5
 MAX_RUNS = 40  # this repository's in-flight runs whose jobs are counted
 GITHUB_IMAGE = re.compile(r"^(ubuntu|windows|macos)-[0-9a-z.-]+$")
 GITHUB_FAMILIES = ("macos", "windows", "ubuntu")
+GITHUB_OFF_MAX_AGE = 6 * 3600  # seconds the github_off switch in a frozen health value still holds
 WAIT_DEPTH = 2  # jobs of one run that may wait for one busy pool of ours (2026-11-16: 6 macOS jobs queued behind 2 slots while GitHub emptied); past it they overflow
 GITHUB_SATURATED_AFTER = 180  # seconds a family's oldest queued GitHub job waits before it is saturated
 
@@ -331,8 +332,20 @@ def github_off(value, now):
     `github-off` switch): a job of one never goes to GitHub, it waits for our pool however long and however
     many wait (2026-11-17, "use only our runners": GitHub's macOS arm64 capacity dropped queued jobs all day
     while WAIT_DEPTH still overflowed the third job of a run). Stale or missing health: none off."""
-    health = _fresh(value, now)
-    off = health.get("github_off") if health else None
+    # Not `_fresh`: GitHub freezes the variable when the run starts, so a picker later in a long run
+    # (a test stage after a 40-min build) sees it 15-60 min old, and the ops switch must still hold
+    # (2026-11-17: 33 jobs of a denext.26 gate went to GitHub with the switch on). The switch expires
+    # on its own in the watchdog; a value older than GITHUB_OFF_MAX_AGE is ignored.
+    try:
+        health = json.loads(value or "")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(health, dict):
+        return set()
+    at = health.get("checked_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or now - at > GITHUB_OFF_MAX_AGE:
+        return set()
+    off = health.get("github_off")
     if not isinstance(off, list):
         return set()
     return {f for f in off if f in GITHUB_FAMILIES}
