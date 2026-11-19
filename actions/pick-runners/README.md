@@ -106,6 +106,19 @@ those three with a Docker daemon. An idle `-2204` label is therefore no free cap
   pickers: the jobs API lists a job only once its `needs` are done). The later run always yields, so two pickers never wait
   for each other. Across repositories the fleet's `queued` count (published every ~1-5 min) is
   the only signal.
+- Routing rules: the health's optional `routing` (`{"v": 1, "classes": [{"labels": [...], "repo"?,
+  "workflow"?, "github": true|false, "order": [our pools]}]}`, published by the fleet watchdog from the
+  user's `routing.json`, which Fleet's Routing form edits) says which job classes may use GitHub at
+  all. Classes are checked in order; the first one that fits a job's label (and this run's repository
+  and workflow file, `*` globs) decides. `github: false` keeps every job of the label on our pool
+  (`ours (routing)`): no threshold, no depth limit, even on an unhealthy pool or when the job may not
+  fit, since the user said "not at all". `github: true` (GitHub as the last entry of the order) is the
+  rule above, unchanged. `order` is our pools, most preferred first: which of them takes a job is the
+  fleet scheduler's decision (a label's runners are interchangeable to GitHub), so the picker only
+  names it in the decision's `why`. Like `github_off` the rules hold in a value frozen at run start
+  for up to 6 h; no `routing`, another version, or anything malformed: nothing changes. A fork's pull
+  request still never runs on our runners. Classes that match on a job's NAME are not published: a
+  picker runs before the jobs exist under names it could check.
 - Fork pull requests (and any `pull_request_*` but `pull_request` itself): GitHub images only,
   pinned jobs included, no API call.
 - macOS: of the jobs past the threshold, at most `macos-cap` (default 3) per run go to GitHub (its

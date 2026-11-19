@@ -416,6 +416,63 @@ def github_off(value, now):
     return {f for f in off if f in GITHUB_FAMILIES}
 
 
+def _glob(pattern, value):
+    """`*` matches anything; the rest literally, case-insensitive (the routing rules' repo / workflow globs)."""
+    return re.fullmatch(".*".join(re.escape(part) for part in pattern.split("*")), value, re.IGNORECASE) is not None
+
+
+def routing_no_github(value, now, repo, workflow):
+    """The runs-on labels whose jobs may NOT go to GitHub-hosted runners, from the fleet's routing rules
+    (the health's `routing`: {v: 1, classes: [{labels?, repo?, workflow?, github, order}]}, published by
+    the watchdog from routing.json; the user edits it in Fleet). Classes are checked in order and the
+    FIRST one that fits a label (and this run's repository and workflow file) decides: a class without
+    "github" in its order keeps its jobs on our pools however long they wait, exactly like the ops
+    switch. Classes that match on a job's name are not published (a picker cannot know it).
+
+    {label: "<our pools in order>"} for the labels held back. Like `github_off` it holds in a frozen
+    value up to GITHUB_OFF_MAX_AGE; no `routing`, a newer version or anything malformed: nothing held."""
+    try:
+        health = json.loads(value or "")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(health, dict):
+        return {}
+    at = health.get("checked_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or now - at > GITHUB_OFF_MAX_AGE:
+        return {}
+    routing = health.get("routing")
+    if not isinstance(routing, dict) or routing.get("v") != 1 or not isinstance(routing.get("classes"), list):
+        return {}
+    path = workflow or ""
+    out, seen = {}, set()
+    for c in routing["classes"]:
+        if not isinstance(c, dict) or not isinstance(c.get("github"), bool):
+            continue
+        r, w, labels = c.get("repo"), c.get("workflow"), c.get("labels")
+        if isinstance(r, str) and not _glob(r, repo or ""):
+            continue
+        if isinstance(w, str) and not (_glob(w, path) or _glob(w, path.rsplit("/", 1)[-1])):
+            continue
+        if not isinstance(labels, list):
+            continue  # a class for every label of a repository / workflow is not expressible per label here
+        for label in labels:
+            if not isinstance(label, str) or label.lower() in seen:
+                continue
+            seen.add(label.lower())  # the first class that fits decides
+            if not c["github"]:
+                order = c.get("order") if isinstance(c.get("order"), list) else []
+                out[label.lower()] = " > ".join(str(o) for o in order[:8])
+    return out
+
+
+def workflow_path(env):
+    """This run's workflow file (".github/workflows/ci.yml") from GITHUB_WORKFLOW_REF
+    ("owner/repo/.github/workflows/ci.yml@refs/heads/x"), or ""."""
+    ref = (env.get("GITHUB_WORKFLOW_REF") or "").split("@", 1)[0]
+    parts = ref.split("/", 2)
+    return parts[2] if len(parts) == 3 else ""
+
+
 def image_family(image):
     """The GitHub image family of a runs-on image (`macos-15` -> macos), or None
     for anything that is not one of GITHUB_FAMILIES."""
@@ -693,7 +750,7 @@ def _fmt_min(m):
 
 
 def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None,
-             load=None, max_wait=None, records=None, live=None, now=None):
+             load=None, max_wait=None, records=None, live=None, now=None, no_github=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their slots whatever is
     free), then the rest in priority order:
 
@@ -706,6 +763,9 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
       pool (`notes`) waits forever: GitHub;
     - without the load (stale health), our pool only while it and its group have a free slot
       (`free` / `groups`), else the image (fail open toward speed, as before);
+    - a job whose label the routing rules keep off GitHub (`no_github`, {label: our pools in
+      order}; `routing_no_github`) always takes our pool: no threshold, no depth limit, even when
+      the pool is unhealthy or the job may not fit (the user said "not at all");
     - past the threshold (or with no free slot), a job of a family ops turned off (`off`) waits
       for our pool anyway; a macOS job past the macOS cap, or a job whose image family is
       saturated on GitHub (`saturated`), waits too, but only for a pool that is merely busy (no
@@ -815,6 +875,17 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
         if p.mode == "image":
             # the job's own @image wins (a leg keeps the image its build ran on)
             plan[key], rows[key] = job["image"] or p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
+            continue
+        if p.label.lower() in (no_github or {}):
+            # the routing rules: this class never goes to GitHub, whatever the wait
+            take(p)
+            order = (no_github or {})[p.label.lower()]
+            why = f"routing rules: GitHub is not allowed for {p.label}" + (f" (our pools, in order: {order})" if order else "")
+            if notes.get(p.label):
+                why += f"; {notes[p.label]}"
+            if job["mem"] and job["mem"] > mem_of(p):
+                why += f"; needs {job['mem']} GB, {p.label} holds {mem_of(p)} (may not fit)"
+            plan[key], rows[key] = p.runs_on, (p.name, "ours (routing)", why)
             continue
         if job["mem"] and job["mem"] > mem_of(p):
             # our pool cannot hold the job (the linux-arm64 OOM): GitHub's image whatever is free
@@ -1257,7 +1328,8 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         live = live_entries(health) if health is not None and not aged else None
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
                               github_off(variables.get("DENEXT_POOL_HEALTH"), now),
-                              None if load[0] is None else load, max_wait, records, live, now)
+                              None if load[0] is None else load, max_wait, records, live, now,
+                              routing_no_github(variables.get("DENEXT_POOL_HEALTH"), now, repo, workflow_path(env)))
         LAST["blocked"] = sorted(l for l, n in notes.items() if n)
         for key, r in records.items():
             r["runs_on"] = plan[key]
