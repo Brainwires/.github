@@ -77,6 +77,13 @@ its GitHub image.
   most one job on the label can use, swap included) when the health is fresh, else a default:
   linux-x64 / -2204 / -docker 7, windows-x64 / -fast / windows-arm64 8, macos-arm64 8, macos-x64 16,
   linux-arm64 8, linux-arm64-desktop 10.
+- The Mac host's memory: `macos-arm64`, `windows-arm64` and `linux-arm64` have their own slots but
+  share one RAM budget (16 GB; the variable `RUNNER_MINI_MEM_GB` overrides it). A job takes 8, 8 and
+  6 GB of it, counted like slots (the busy runners, the running and the queued jobs of the three
+  labels; a pool that is not ok or paused counts nothing). A job whose label has a free slot but
+  whose memory is spent takes its image (`the mini-host pools are full`), or waits under the macOS
+  rules above: two macOS VMs running, and a Linux arm64 job goes to GitHub's arm64 image at once
+  instead of waiting for a VM to end. Stale health: one job for the whole host.
 - The pool variables (`RUNNER_WINDOWS_X64`, …): unset → the GitHub image; a GitHub image
   (`windows-latest`) → that image (a job's own `@image` wins); our label (`["self-hosted","denext-windows-x64"]`) → our pool
   with overflow.

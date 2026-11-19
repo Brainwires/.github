@@ -183,6 +183,90 @@ class LinuxArm64Test(unittest.TestCase):
         self.assertEqual(plan, {"a": "ubuntu-24.04-arm", "b": "ubuntu-22.04-arm"})
 
 
+class MiniHostTest(unittest.TestCase):
+    """The Mac host's pools share one RAM budget (16 GB): macOS and Windows arm64 VMs 8 GB each,
+    a Linux arm64 job container 6. A slot that looks free is no room when the memory is spent."""
+
+    ARM = '["self-hosted","denext-linux-arm64"]'
+    WINARM = '["self-hosted","denext-windows-arm64"]'
+    VARS = {"RUNNER_LINUX_ARM64": ARM, "RUNNER_MACOS_ARM": MAC, "RUNNER_WINDOWS_ARM": WINARM}
+
+    def pools(self, mac=0, linux=0, win=0, **more):
+        return {"denext-macos-arm64": entry(2, busy=mac), "denext-linux-arm64": entry(1, busy=linux),
+                "denext-windows-arm64": entry(2, busy=win), **more}
+
+    def test_two_macos_vms_leave_no_room_for_a_linux_arm64_job(self):
+        # Brainwires/deno 2026-11-18/19: the build waited 10-36 min on its "free" slot.
+        plan, rows, free, _ = run(env("build=linux-arm64@ubuntu-22.04-arm", health(self.pools(mac=2)), **self.VARS))
+        self.assertEqual(free["denext-linux-arm64"], 1)
+        self.assertEqual(plan, {"build": "ubuntu-22.04-arm"})
+        self.assertIn("mini-host pools are full", rows[0][3])
+
+    def test_one_macos_vm_leaves_room_for_one_more_job(self):
+        h = health(self.pools(mac=1))
+        plan, _, _, _ = run(env("build=linux-arm64@ubuntu-22.04-arm", h, **self.VARS))
+        self.assertEqual(plan, {"build": ours(self.ARM)})
+        # 8 + 8 fills it: the Linux job after a second macOS job takes its image.
+        plan, _, _, _ = run(env("lint=macos-arm64 build=linux-arm64@ubuntu-22.04-arm", h, **self.VARS))
+        self.assertEqual(plan, {"lint": ours(MAC), "build": "ubuntu-22.04-arm"})
+        # 8 + 6 leaves 2 GB: no second VM.
+        plan, _, _, _ = run(env("build=linux-arm64 lint=macos-arm64", h, **self.VARS))
+        self.assertEqual(plan, {"build": ours(self.ARM), "lint": "macos-latest"})
+
+    def test_an_idle_host_takes_two_vms_or_a_vm_and_a_container(self):
+        h = health(self.pools())
+        plan, _, _, _ = run(env("a=macos-arm64 b=macos-arm64 c=linux-arm64", h, **self.VARS))
+        self.assertEqual(plan, {"a": ours(MAC), "b": ours(MAC), "c": "ubuntu-24.04-arm"})
+        plan, _, _, _ = run(env("c=linux-arm64 a=macos-arm64 b=macos-arm64", h, **self.VARS))
+        self.assertEqual(plan, {"c": ours(self.ARM), "a": ours(MAC), "b": "macos-latest"})
+
+    def test_queued_jobs_of_the_other_pools_count(self):
+        # one VM booting for one of two queued macOS jobs: both VMs' memory is promised
+        # (busy and queued overlap, as for a label's slots: the larger of the two counts)
+        h = health(self.pools(**{"denext-macos-arm64": entry(2, busy=1, queued=2)}))
+        plan, _, _, _ = run(env("build=linux-arm64", h, **self.VARS))
+        self.assertEqual(plan, {"build": "ubuntu-24.04-arm"})
+
+    def test_a_disabled_pools_queue_takes_no_memory(self):
+        off = dict(entry(2, ok=False, queued=3), reason="disabled by config")
+        h = health(self.pools(mac=1, **{"denext-windows-arm64": off}))
+        plan, _, _, _ = run(env("build=linux-arm64", h, **self.VARS))
+        self.assertEqual(plan, {"build": ours(self.ARM)})
+
+    def test_a_macos_job_waits_for_the_memory_while_github_macos_is_off(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - 60, "github_off": ["macos"],
+                        "pools": self.pools(mac=1, linux=1)})
+        plan, rows, _, _ = run(env("lint=macos-arm64", h, **self.VARS))
+        self.assertEqual(plan, {"lint": ours(MAC)})
+        self.assertEqual(rows[0][2], "ours (waits)")
+
+    def test_the_budget_variable(self):
+        h = health(self.pools(mac=2))
+        plan, _, _, _ = run(env("build=linux-arm64", h, RUNNER_MINI_MEM_GB="22", **self.VARS))
+        self.assertEqual(plan, {"build": ours(self.ARM)})
+
+    def test_an_aged_value_counts_the_busy_runners_live(self):
+        # idle when the run started; two macOS VMs run now
+        h = health(self.pools(), age=20 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        vm = {"status": "online", "busy": True, "labels": [{"name": "denext-macos-arm64"}]}
+        plan, _, _, _ = run(env("build=linux-arm64@ubuntu-22.04-arm", h, **self.VARS), get=api,
+                            runner_get=FakeApi(runners=[vm, vm]))
+        self.assertEqual(plan, {"build": "ubuntu-22.04-arm"})
+        plan, _, _, _ = run(env("build=linux-arm64@ubuntu-22.04-arm", h, **self.VARS), get=api,
+                            runner_get=FakeApi(runners=[vm]))
+        self.assertEqual(plan, {"build": ours(self.ARM)})
+
+    def test_stale_health_sends_one_job_to_the_host(self):
+        plan, _, _, _ = run(env("a=macos-arm64 c=linux-arm64 b=macos-arm64", None, **self.VARS))
+        self.assertEqual(plan, {"a": ours(MAC), "c": "ubuntu-24.04-arm", "b": "macos-latest"})
+
+    def test_a_pinned_job_takes_its_memory_first(self):
+        h = health(self.pools(mac=1))
+        plan, _, _, _ = run(env("build=linux-arm64 gui=macos-arm64!", h, **self.VARS))
+        self.assertEqual(plan, {"build": "ubuntu-24.04-arm", "gui": ours(MAC)})
+
+
 class HealthTest(unittest.TestCase):
     def test_not_ok_is_zero(self):
         h = health({"denext-windows-x64": dict(entry(2, ok=False), reason="guest unreachable")})
