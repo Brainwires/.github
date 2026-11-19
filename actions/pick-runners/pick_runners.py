@@ -49,6 +49,11 @@ Inputs (environment; the action maps its inputs onto these):
   (the org's jobs queued on GitHub's images of that family; see
   `github_saturated`). Both are as fresh as `checked_at`: stale health
   ignores them too, and an aged one (`aged_health`) keeps `mem_gb` only.
+  Two more pool-entry fields drive the expected wait while the health is
+  fresh: `live` ([[start, eta], ...] epochs, one pair per busy slot of the
+  label, eta = when the slot is expected to free) and `job_s` (the label's
+  median job duration in seconds); see `live_wait`. Without them, or with an
+  aged or stale value, the wait comes from the table (POOL_JOB_MINUTES).
 - PICK_MAX_WAIT (optional): the per-family thresholds in minutes, any subset of
   `linux=10 windows=15 macos=20` (DEFAULT_MAX_WAIT); 0 restores the free-slot-only rule.
   A family that is off (`github_off`) never goes to GitHub whatever the wait.
@@ -609,6 +614,60 @@ def expected_wait(cap, taken, need, minutes):
     return (waves - 0.5) * minutes
 
 
+OVERRUN_FLOOR = 60  # seconds: a job past its ETA is assumed to end soon, not now
+
+
+def live_entries(health_pools):
+    """{label: (busy, [eta, ...] ascending, job_s or None)} for the labels whose FRESH health entry
+    carries a well-formed `live` list ([[start_epoch, eta_epoch], ...], one pair per busy slot; `[]`
+    when none is busy). `job_s` (the label's median job duration, seconds) is kept when it is a
+    positive number. A label without `live` (an older publisher) or with a malformed one is left out:
+    its wait comes from the table. Callers pass only a fresh value (never an aged or stale one: the
+    ETAs are as old as `checked_at`)."""
+    out = {}
+    for label, e in (health_pools or {}).items():
+        if not isinstance(e, dict) or not isinstance(e.get("live"), list):
+            continue
+        etas = []
+        for pair in e["live"]:
+            if (not isinstance(pair, (list, tuple)) or len(pair) != 2
+                    or any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in pair)):
+                etas = None
+                break
+            etas.append(float(pair[1]))
+        if etas is None:
+            continue
+        job_s = e.get("job_s")
+        job_s = float(job_s) if not isinstance(job_s, bool) and isinstance(job_s, (int, float)) and job_s > 0 else None
+        out[label] = (_n(e.get("busy")) or 0, sorted(etas), job_s)
+    return out
+
+
+def live_wait(cap, taken, busy, etas, job_s, minutes, now, need=1):
+    """Minutes one more job waits for a label of `cap` slots of which `taken` are held or promised
+    (busy, running, queued, and this picker's earlier placements), from the fleet's live per-slot ETAs.
+
+    The slots' free times (seconds from `now`): a free slot at 0; a busy slot with an ETA at
+    max(eta - now, OVERRUN_FLOOR) (a job past its ETA ends soon, not now); a busy slot the fleet gave
+    no ETA (`busy` > len(etas)) at half a job. A job is `job_s` seconds when the label has a median,
+    else the table's `minutes`. The jobs ahead (`taken` beyond the busy slots: queued, and placed by
+    this picker) each take the earliest free slot and hold it a job long; this job's wait is the
+    earliest free time left. Busy slots past `cap` (a slot no longer healthy finishing its job) are
+    the latest ETAs and are dropped: that slot takes no new job. No capacity, or `need` above it:
+    infinite."""
+    if cap <= 0 or need > cap:
+        return float("inf")
+    per_job = job_s if job_s else minutes * 60
+    busy_n = max(busy, len(etas))
+    times = sorted([max(eta - now, OVERRUN_FLOOR) for eta in etas] + [per_job / 2] * (busy_n - len(etas)))
+    times = ([0.0] * max(0, cap - busy_n) + times)[:cap]
+    for _ in range(max(0, taken - busy_n)):
+        t = min(times)
+        times.remove(t)
+        times.append(t + per_job)
+    return min(times) / 60
+
+
 def max_wait_thresholds(text):
     """PICK_MAX_WAIT (`linux=10 windows=15 macos=20`, any subset, minutes >= 0) over DEFAULT_MAX_WAIT.
     Returns ({family name: minutes}, [the entries it ignored])."""
@@ -634,7 +693,7 @@ def _fmt_min(m):
 
 
 def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None,
-             load=None, max_wait=None, records=None):
+             load=None, max_wait=None, records=None, live=None, now=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their slots whatever is
     free), then the rest in priority order:
 
@@ -654,9 +713,14 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
 
     `mem` is {pool name: GB} (`mem_capacity`; POOL_MEM_GB for a pool it leaves out). Followers copy
     their target. Each row's `why` names the pool, the expected wait and the threshold. `records`, a
-    dict when given, gets {key: {pool, label, wait (minutes, None when not measured), threshold,
-    eligible (our pool in use, healthy, the job fits: GitHub only past the threshold)}} for every
-    unpinned job (the tripwire's input; see `tripwires`)."""
+    dict when given, gets {key: {pool, label, wait (minutes, None when not measured), source ("live":
+    the fleet's per-slot ETAs, "table": POOL_JOB_MINUTES; None when not measured), threshold, eligible
+    (our pool in use, healthy, the job fits: GitHub only past the threshold)}} for every unpinned job
+    (the tripwire's input; see `tripwires`).
+
+    `live` ({label: (busy, etas, job_s)}, `live_entries` of a FRESH health value) and `now` (epoch)
+    measure a label's (and a parent label's) wait from the live ETAs (`live_wait`); a label it leaves
+    out, and every host group, use the table (`expected_wait`)."""
     free = dict(free)
     groups = dict(groups)
     notes, saturated = notes or {}, saturated or {}
@@ -671,22 +735,35 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
     def group_minutes(group):
         return max(POOL_JOB_MINUTES[n] for n in POOLS if POOLS[n][3] == group)
 
+    live_ = live or {}
+
+    def label_wait(label, minutes):
+        """(minutes, description, source, minutes per job) of one more job on one label."""
+        cap, taken = label_load_.get(label, (0, 0))
+        desc = f"{label} {taken}/{cap} slots taken"
+        if label in live_ and now is not None:
+            busy, etas, job_s = live_[label]
+            per = job_s / 60 if job_s else minutes
+            return live_wait(cap, taken, busy, etas, job_s, minutes, now), desc, "live", per
+        return expected_wait(cap, taken, 1, minutes), desc, "table", minutes
+
     def job_wait(p):
-        """(minutes, what binds it: a short description) for one more job on `p`."""
+        """(minutes, what binds it: a short description, "live" | "table", minutes per job) for one
+        more job on `p`."""
         minutes = POOL_JOB_MINUTES[p.name]
-        cap, taken = label_load_.get(p.label, (0, 0))
-        worst = (expected_wait(cap, taken, 1, minutes), f"{p.label} {taken}/{cap} slots taken")
+        worst = label_wait(p.label, minutes)
         if p.parent_label:
-            cap, taken = label_load_.get(p.parent_label, (0, 0))
-            w = expected_wait(cap, taken, 1, minutes)
-            if w > worst[0]:
-                worst = (w, f"{p.parent_label} {taken}/{cap} slots taken")
+            # the table path keeps measuring the parent with this pool's minutes, as before
+            w = label_wait(p.parent_label, minutes)
+            if w[0] > worst[0]:
+                worst = w
         if p.group and p.group in group_load_:
             cap, taken = group_load_[p.group]
             unit = "GB" if p.group in GROUP_WEIGHT else "slots"
-            w = expected_wait(cap, taken, group_weight(p.name), group_minutes(p.group))
+            gm = group_minutes(p.group)
+            w = expected_wait(cap, taken, group_weight(p.name), gm)
             if w > worst[0]:
-                worst = (w, f"the {p.group} pools {taken}/{cap} {unit} taken")
+                worst = (w, f"the {p.group} pools {taken}/{cap} {unit} taken", "table", gm)
         return worst
 
     def take(p):
@@ -746,15 +823,21 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             plan[key], rows[key] = image, (p.name, "GitHub", f"needs {job['mem']} GB, {p.label} holds {mem_of(p)}")
             continue
         if records is not None:
-            records[key] = {"pool": p.name, "label": p.label, "wait": None, "threshold": limit,
+            records[key] = {"pool": p.name, "label": p.label, "wait": None, "source": None, "threshold": limit,
                             "eligible": load is not None and not notes.get(p.label)}
         if load is not None:
-            wait, binding = job_wait(p) if not notes.get(p.label) else (float("inf"), notes[p.label])
+            if notes.get(p.label):
+                wait, binding, source, per = float("inf"), notes[p.label], None, POOL_JOB_MINUTES[p.name]
+            else:
+                wait, binding, source, per = job_wait(p)
             if records is not None and wait != float("inf"):
                 records[key]["wait"] = round(wait, 1)
+                records[key]["source"] = source
             room = wait == 0
             within = wait <= limit
-            stat = f"expected wait {_fmt_min(wait)} min ({binding}; ~{POOL_JOB_MINUTES[p.name]} min/job), threshold {_fmt_min(limit)} min"
+            how = f"{source}, " if source else ""
+            stat = (f"expected wait {_fmt_min(round(wait, 1))} min ({binding}; {how}~{_fmt_min(round(per, 1))} min/job),"
+                    f" threshold {_fmt_min(limit)} min")
         else:
             room = free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) >= group_weight(p.name)) and (
                 p.parent_label not in free or free[p.parent_label] > 0)
@@ -1170,9 +1253,11 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         load = pool_load(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
         records = {}
+        # The live per-slot ETAs count only in a FRESH value: an aged one's are as old as the run.
+        live = live_entries(health) if health is not None and not aged else None
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
                               github_off(variables.get("DENEXT_POOL_HEALTH"), now),
-                              None if load[0] is None else load, max_wait, records)
+                              None if load[0] is None else load, max_wait, records, live, now)
         LAST["blocked"] = sorted(l for l, n in notes.items() if n)
         for key, r in records.items():
             r["runs_on"] = plan[key]

@@ -1196,6 +1196,128 @@ class BurstTest(unittest.TestCase):
         self.assertEqual(list(plan.values()), [ours(MAC)] * 5)
 
 
+def live_entry(slots, busy=0, live=None, job_s=None, queued=None):
+    e = entry(slots, busy=busy, queued=queued)
+    if live is not None:
+        e["live"] = live
+    if job_s is not None:
+        e["job_s"] = job_s
+    return e
+
+
+class LiveWaitTest(unittest.TestCase):
+    """The expected wait from the fleet's live per-slot ETAs (`live`, `job_s`), the table only as fallback."""
+
+    def test_free_slots_wait_nothing(self):
+        self.assertEqual(pr.live_wait(3, 1, 1, [NOW + 600], 900, 10, NOW), 0)
+        self.assertEqual(pr.live_wait(3, 0, 0, [], None, 10, NOW), 0)
+
+    def test_all_busy_waits_for_the_earliest_eta(self):
+        self.assertEqual(pr.live_wait(2, 2, 2, [NOW + 180, NOW + 1200], 900, 20, NOW), 3)
+
+    def test_a_job_past_its_eta_ends_soon_not_now(self):
+        self.assertEqual(pr.live_wait(1, 1, 1, [NOW - 300], 900, 20, NOW), 1)  # OVERRUN_FLOOR
+        self.assertEqual(pr.live_wait(2, 2, 2, [NOW - 900, NOW + 30], 900, 20, NOW), 1)
+
+    def test_busy_slots_without_an_eta_are_half_a_job(self):
+        # 2 busy, one ETA (20 min): the other frees after job_s / 2 = 7.5 min
+        self.assertEqual(pr.live_wait(2, 2, 2, [NOW + 1200], 900, 20, NOW), 7.5)
+        # no job_s: the table's minutes / 2
+        self.assertEqual(pr.live_wait(2, 2, 2, [NOW + 1200], None, 20, NOW), 10)
+
+    def test_jobs_ahead_drain_with_job_s(self):
+        # 2 slots free at 2 and 4 min; 3 queued ahead, 10 min each: 2->12, 4->14, 12->22; ours at 14
+        self.assertEqual(pr.live_wait(2, 5, 2, [NOW + 120, NOW + 240], 600, 30, NOW), 14)
+        # one free slot and one ahead: the free slot goes to the job ahead, ours waits for the busy one
+        self.assertEqual(pr.live_wait(2, 2, 1, [NOW + 300], 600, 30, NOW), 5)
+        # no job_s: the jobs ahead take the table's minutes
+        self.assertEqual(pr.live_wait(1, 2, 1, [NOW + 120], None, 10, NOW), 12)
+
+    def test_no_capacity_is_infinite(self):
+        self.assertEqual(pr.live_wait(0, 0, 0, [], 600, 10, NOW), float("inf"))
+        self.assertEqual(pr.live_wait(2, 0, 0, [], 600, 10, NOW, need=3), float("inf"))
+
+    def test_busy_past_the_capacity_keeps_the_earliest(self):
+        self.assertEqual(pr.live_wait(1, 2, 2, [NOW + 120, NOW + 900], 600, 10, NOW), 2)
+
+    def test_malformed_live_falls_back_to_the_table(self):
+        got = pr.live_entries({"a": {"live": [[1, 2], [3]]}, "b": {"live": "x"}, "c": {"busy": 1},
+                               "d": {"busy": 1, "live": [[1, NOW + 9], [0, NOW + 3]], "job_s": True}})
+        self.assertEqual(got, {"d": (1, [NOW + 3, NOW + 9], None)})
+
+    def test_the_pick_uses_the_live_etas_when_fresh(self):
+        # windows-x64, both slots busy: the table says 10 min (half a 20-min job); the ETAs say 2
+        h = health({"denext-windows-x64": live_entry(2, busy=2, live=[[NOW - 600, NOW + 120], [NOW - 60, NOW + 1500]],
+                                                     job_s=1200)})
+        plan, rows, decisions, trip = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertEqual(decisions["a"]["wait"], 2)
+        self.assertEqual(decisions["a"]["source"], "live")
+        self.assertIn("expected wait 2 min (denext-windows-x64 2/2 slots taken; live, ~20 min/job)", rows[0][3])
+        self.assertEqual(trip, [])
+
+    def test_the_pick_overflows_on_late_etas(self):
+        # the table would wait 10 min (within 15); the live ETAs say 25 min: GitHub
+        h = health({"denext-windows-x64": live_entry(2, busy=2, live=[[NOW, NOW + 1500], [NOW, NOW + 1600]],
+                                                     job_s=1200)})
+        plan, rows, decisions, trip = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": "windows-latest"})
+        self.assertEqual(decisions["a"]["wait"], 25)
+        self.assertIn("live", rows[0][3])
+        self.assertEqual(trip, [])
+
+    def test_this_runs_own_placements_queue_behind_the_etas(self):
+        # 1 free slot, 1 busy freeing in 3 min, job_s 5 min: a free, b 3 min, c 5 (the free slot again), d 8
+        h = health({"denext-windows-x64": live_entry(2, busy=1, live=[[NOW, NOW + 180]], job_s=300)})
+        plan, _, decisions, _ = records_of(env("a=windows-x64 b=windows-x64 c=windows-x64 d=windows-x64", h,
+                                               max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual([decisions[k]["wait"] for k in "abcd"], [0, 3, 5, 8])
+
+    def test_the_parent_label_is_measured_live_too(self):
+        h = health({"denext-windows-x64": live_entry(2, busy=2, live=[[NOW, NOW + 1800], [NOW, NOW + 2400]], job_s=1200),
+                    "denext-windows-x64-fast": live_entry(1, busy=0, live=[], job_s=3600)})
+        plan, rows, decisions, _ = records_of(env("t=windows-x64-fast", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"t": "windows-latest"})
+        self.assertEqual(decisions["t"]["wait"], 30)
+        self.assertIn("denext-windows-x64 2/2 slots taken; live", rows[0][3])
+
+    def test_no_live_field_uses_the_table(self):
+        h = health({"denext-windows-x64": live_entry(2, busy=2, job_s=60)})
+        plan, rows, decisions, _ = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(decisions["a"]["wait"], 10)
+        self.assertEqual(decisions["a"]["source"], "table")
+        self.assertIn("table, ~20 min/job", rows[0][3])
+
+    def test_an_aged_value_uses_the_table(self):
+        h = health({"denext-windows-x64": live_entry(2, busy=2, live=[[NOW, NOW + 60], [NOW, NOW + 60]], job_s=60)},
+                   age=20 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        plan, rows, decisions, _ = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN), get=api)
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertEqual(decisions["a"]["wait"], 10)
+        self.assertEqual(decisions["a"]["source"], "table")
+
+    def test_a_stale_value_uses_the_free_slot_rule(self):
+        h = health({"denext-windows-x64": live_entry(2, busy=2, live=[[NOW, NOW + 60], [NOW, NOW + 60]], job_s=60)},
+                   age=11 * 60)
+        plan, rows, decisions, _ = records_of(env("a=windows-x64 b=windows-x64", h, max_wait=None,
+                                                  RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": ours(WIN), "b": "windows-latest"})
+        self.assertIsNone(decisions["b"]["wait"])
+        self.assertIsNone(decisions["b"]["source"])
+        self.assertIn("health stale", rows[1][3])
+
+    def test_the_host_group_keeps_the_table(self):
+        # the label is live (a free slot), the Mac host's memory (two VMs) binds on the table
+        h = health({"denext-macos-arm64": live_entry(2, busy=2, live=[[NOW, NOW + 60], [NOW, NOW + 60]], job_s=600),
+                    "denext-linux-arm64": live_entry(1, live=[], job_s=600), "denext-windows-arm64": entry(2)})
+        e = env("build=linux-arm64", h, max_wait=None, RUNNER_LINUX_ARM64=ARM, RUNNER_MACOS_ARM=MAC,
+                RUNNER_WINDOWS_ARM=WINARM)
+        _, rows, decisions, _ = records_of(e)
+        self.assertEqual(decisions["build"]["source"], "table")
+        self.assertIn("the mini-host pools 16/16 GB taken; table", rows[0][3])
+
+
 class TripwireTest(unittest.TestCase):
     def test_flags_a_github_placement_within_the_threshold(self):
         records = {"a": {"pool": "linux-x64", "label": "denext-linux-x64", "wait": 5.0, "threshold": 10, "eligible": True},
