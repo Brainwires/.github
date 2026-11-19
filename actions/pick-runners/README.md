@@ -51,6 +51,24 @@ windows-arm64 30, macos-arm64 20, macos-x64 30, linux-arm64 30, linux-arm64-desk
 uses its slowest pool's. Example (the 4.20.1 gate, 12 Linux jobs, the host's 3 slots idle): 3 start,
 3 wait ~5 min, the other 6 would wait 15+ min and take `ubuntu-latest`.
 
+**Live ETAs.** When the health value is fresh (at most 10 min old) and a label's entry carries
+`live`, the label's wait comes from the fleet's per-slot ETAs instead of the table:
+
+- `live`: `[[start_epoch, eta_epoch], ...]`, one pair per busy slot of the label (merged across the
+  pools that share it), sorted by eta; `eta` is when the slot is expected to free (its start plus the
+  job's own median duration by name, else the label's). `[]` when no slot is busy.
+- `job_s`: the label's rolling median job duration in seconds (launch to slot free), for the jobs
+  queued ahead that have no ETA yet. Optional.
+
+Each free slot frees at 0, each busy slot with an ETA at `max(eta − now, 60 s)` (a job past its ETA
+ends soon, not now), each busy slot beyond `len(live)` at half a job. Every job ahead (queued on the
+label, and this run's own earlier placements) takes the earliest free time and holds the slot one job
+(`job_s`, else the table's minutes); the job's wait is the earliest time left. The same applies to the
+parent label. The host groups (the Linux host's shared slots, the Mac host's memory) keep the table.
+An aged or stale value, or a label without `live` (an older publisher, or a malformed list), uses the
+table rule above, unchanged. The decision's `why` says which (`live, ~N min/job` or
+`table, ~N min/job`) and the `pick-runners decision` line carries `"source": "live" | "table"`.
+
 **Thresholds** (`max-wait`: any subset of `linux=10 windows=15 macos=20`, the defaults; `0` restores
 the old free-slot-or-GitHub rule). A family ops turned off (`github_off`) never goes to GitHub.
 
