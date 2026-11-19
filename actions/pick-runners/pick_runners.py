@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Pick each job's runner for one workflow run: our self-hosted pools first,
-GitHub's hosted image for whatever our pools cannot start right now.
+GitHub's hosted image only as the backup.
 
-Our runners are there to make CI faster (more cores and RAM per machine), never
-to make it wait. So a job goes to our pool only while that pool has a free
-slot for it; every other job goes to the GitHub-hosted equivalent at once.
+A job goes to our pool unless its EXPECTED WAIT there exceeds its family's
+threshold (PICK_MAX_WAIT; Linux 10 min, Windows 15, macOS 20). The wait comes
+from the pool's slots, what is busy and queued, the jobs this same run has
+already placed on it, and a per-label job duration (POOL_JOB_MINUTES); see
+`expected_wait` and `allocate`. So a burst of jobs that start in the same second
+spreads over our slots, and only the ones that would wait too long overflow. An
+unhealthy, paused, unlisted or stalled pool sends its jobs to GitHub; with stale
+health the old rule holds (a free slot, else GitHub). A job that lands on GitHub
+although its healthy pool's wait was within the threshold is a TRIPWIRE: an
+error annotation, the `tripwire` output and a line in the step summary.
 
 The org's workflows run this through the composite action next to it
 (Brainwires/.github/actions/pick-runners). One picker job per workflow run
@@ -14,9 +21,9 @@ reads `fromJSON(needs.<picker>.outputs.plan).<key>`.
 Inputs (environment; the action maps its inputs onto these):
 
 - PICK_JOBS: the jobs, in priority order (whitespace or newline separated).
-  The first ones take our free slots. Each entry is one of
+  The first ones are measured first (each placement lengthens the queue for the next). Each entry is one of
 
-      key=pool            our pool while it has a free slot, else its image
+      key=pool            our pool unless its expected wait exceeds the threshold, else its image
       key=pool@image      the same with another GitHub image for the overflow
       key=pool!           pinned: always our pool (the job needs our hardware:
                           a GUI session, the Pi, Windows arm64, ...). It still
@@ -42,6 +49,9 @@ Inputs (environment; the action maps its inputs onto these):
   (the org's jobs queued on GitHub's images of that family; see
   `github_saturated`). Both are as fresh as `checked_at`: stale health
   ignores them too, and an aged one (`aged_health`) keeps `mem_gb` only.
+- PICK_MAX_WAIT (optional): the per-family thresholds in minutes, any subset of
+  `linux=10 windows=15 macos=20` (DEFAULT_MAX_WAIT); 0 restores the free-slot-only rule.
+  A family that is off (`github_off`) never goes to GitHub whatever the wait.
 - PICK_MACOS_CAP: the most macOS jobs this run sends to GitHub (default 3).
   GitHub runs about 5 macOS jobs at once for the whole org; past the cap a
   macOS job waits for our pool instead (when the pool is in use).
@@ -60,8 +70,13 @@ the keys on GitHub>`, `free=<JSON {label: free slots before this run}>`,
 unlisted or stalled in the previous attempt>` (a planner must never make a job
 wait on one of those, macOS cap or not), `saturated=<JSON list of the GitHub
 image families (macos, windows, ubuntu) that were saturated: a job of theirs
-waits for our busy pool instead of joining GitHub's queue>`. A
-decision table goes to stderr (and the step summary, through the action).
+waits for our busy pool instead of joining GitHub's queue>`, `tripwire=<JSON list
+of {key, pool, label, wait, threshold, repo, run_id, attempt, numbers} for each job
+sent to GitHub while its healthy pool's expected wait was within the threshold (or
+by the picker-error fallback)>`. A decision table (each job's pool, expected wait,
+threshold and verdict), one `pick-runners decision <JSON>` line per job, and an
+`::error title=pick-runners tripwire::` annotation per tripwire go to stderr (and
+the table to the step summary, through the action).
 
 This never fails a run: any error sends every job but the pinned ones to its
 image (toward speed), with a warning.
@@ -81,7 +96,7 @@ import urllib.request
 # The variable switches the pool on: unset or empty, its jobs take the image
 # (pinned jobs excepted); naming a GitHub image (`windows-latest`), its jobs take
 # that image; naming our label (a bare label, or a JSON array such as
-# ["self-hosted","denext-windows-x64"]), its jobs take our pool while it has room.
+# ["self-hosted","denext-windows-x64"]), its jobs take our pool unless the wait is too long.
 POOLS = {
     "linux-x64": ("RUNNER_LINUX_X64", "denext-linux-x64", "ubuntu-latest", "linux-host", False),
     "linux-x64-2204": ("RUNNER_LINUX_X64_2204", "denext-linux-x64-2204", "ubuntu-22.04", "linux-host", False),
@@ -138,6 +153,32 @@ GROUP_SLOTS_VAR = {"linux-host": "RUNNER_LINUX_X64_SHARED_SLOTS", "mini-host": "
 # image idle). name -> GB per job; the capacity is the group's variable, else GROUP_MEM_GB.
 GROUP_WEIGHT = {"mini-host": {"macos-arm64": 8, "windows-arm64": 8, "linux-arm64": 6}}
 GROUP_MEM_GB = {"mini-host": 16}
+
+# Typical minutes one job holds a slot of the pool, for the expected wait (see `expected_wait`). These are
+# deliberately conservative per-label estimates from the fleet's 7-day history (2026-11-19): linux-x64's
+# p50 is 26 s and p90 under 5 min, but a denext gate's coverage / integration jobs run 10-20 min;
+# windows-x64's p50 is 19 min; the fast Windows label takes only the long jobs (a 45-75 min build);
+# the Mac host's VMs and arm64 containers run 15-40 min. A wrong guess only moves where the threshold
+# bites: the threshold, not this table, is the knob (PICK_MAX_WAIT).
+POOL_JOB_MINUTES = {
+    "linux-x64": 10,
+    "linux-x64-2204": 10,
+    "linux-x64-docker": 10,
+    "windows-x64": 20,
+    "windows-x64-fast": 60,
+    "windows-arm64": 30,
+    "macos-arm64": 20,
+    "macos-x64": 30,
+    "linux-arm64": 30,
+    "linux-arm64-desktop": 15,
+}
+
+# The longest expected wait (minutes) a job accepts on our pool before it goes to GitHub's image, per
+# family (PICK_MAX_WAIT overrides: `linux=10 windows=15 macos=20`; 0 is the old rule, a free slot or
+# GitHub). macOS is the longest: GitHub runs about 5 macOS jobs for the whole org, and its macOS queue
+# saturates first. A family ops turned off (`github_off`) never goes to GitHub whatever the wait.
+DEFAULT_MAX_WAIT = {"linux": 10, "windows": 15, "macos": 20}
+FAMILY_NAME = {"ubuntu": "linux", "windows": "windows", "macos": "macos"}
 
 
 def group_weight(pool_name):
@@ -442,41 +483,43 @@ def pool_note(label, pools, stalled):
     return None
 
 
-def pool_free(label, pools, counts, stalled):
-    """The free slots of one label: 0 when the fleet marks it not ok or paused,
-    does not list it, or a previous attempt's job sat on it until cancelled;
-    else its healthy slots minus the taken ones."""
+def label_load(label, pools, counts, stalled):
+    """(capacity, taken) of one label: capacity 0 when the fleet marks it not ok or paused, does not
+    list it, or a previous attempt's job sat on it until cancelled; else its healthy slots and the
+    slots taken or promised (`taken_slots`, which may exceed the capacity: the jobs queued past it)."""
     if label in stalled:
-        return 0
+        return 0, 0
     entry = pools.get(label)
     if not isinstance(entry, dict) or entry.get("ok") is not True or entry.get("paused") is True:
-        return 0
+        return 0, 0
     cap = _n(entry.get("healthy_slots"))
     if cap is None:
         cap = _n(entry.get("slots")) or 0
-    return max(0, cap - taken_slots(label, entry, counts))
+    return cap, taken_slots(label, entry, counts)
 
 
-def free_slots(pools_in_use, health_pools, variables, counts, stalled):
-    """({label: free}, {group: free}) for the pools the jobs use.
+def pool_free(label, pools, counts, stalled):
+    """The free slots of one label (`label_load`'s capacity minus its taken slots, at least 0)."""
+    cap, taken = label_load(label, pools, counts, stalled)
+    return max(0, cap - taken)
 
-    Fresh health: per label as `pool_free`; a shared group's capacity is its
-    slots variable, else the largest healthy cap among its labels, minus the
-    slots its labels take together. Stale or missing health: STALE_FREE per
-    label and per group, minus what this repository's runs already hold there
-    (fail open toward speed: one job may wait on a pool we cannot see, the rest
-    go to GitHub)."""
-    free, groups = {}, {}
+
+def pool_load(pools_in_use, health_pools, variables, counts, stalled):
+    """({label: (capacity, taken)}, {group: (capacity, taken)}) for the pools the jobs use, or
+    (None, None) while the health is stale or missing (the load cannot be seen).
+
+    Per label as `label_load`. A shared group's capacity is its variable (slots, or GB for a memory
+    group), else the largest healthy cap among its labels (GROUP_MEM_GB for a memory group); its
+    taken units are the larger of what its labels' busy runners hold and what their running and
+    queued jobs want (weighted by GB in a memory group; a pool that is not ok or paused counts
+    nothing there). `taken` is never clipped at the capacity: the queue past it is the wait."""
     if health_pools is None:
-        for p in pools_in_use:
-            held = counts.running.get(p.label, 0) + counts.queued.get(p.label, 0)
-            free[p.label] = max(0, STALE_FREE - held) if p.label not in stalled else 0
-            if p.group:
-                g = groups.get(p.group, _stale_group_free(p.group))
-                groups[p.group] = max(0, g - held * group_weight(p.name))
-        return free, groups
+        return None, None
+    labels_out, groups = {}, {}
     for p in pools_in_use:
-        free[p.label] = pool_free(p.label, health_pools, counts, stalled)
+        labels_out[p.label] = label_load(p.label, health_pools, counts, stalled)
+        if p.parent_label and p.parent_label not in labels_out:
+            labels_out[p.parent_label] = label_load(p.parent_label, health_pools, counts, stalled)
     group_labels, weight = {}, {}
     for name, (_, label, _, group, _) in POOLS.items():
         if group:
@@ -503,7 +546,7 @@ def free_slots(pools_in_use, health_pools, variables, counts, stalled):
                 if counts.busy_runners is not None:
                     running = max(running, counts.busy_runners.get(l, 0))
                 want += (running + max(_n(e.get("queued")) or 0, counts.queued.get(l, 0))) * weight[l]
-            groups[group] = max(0, cap - max(busy, want))
+            groups[group] = (cap, max(busy, want))
             continue
         if cap is None:
             caps = []
@@ -521,29 +564,130 @@ def free_slots(pools_in_use, health_pools, variables, counts, stalled):
             if counts.busy_runners is not None:
                 running = max(running, counts.busy_runners.get(l, 0))
             want += running + max(_n(e.get("queued")) or 0, counts.queued.get(l, 0))
-        groups[group] = max(0, cap - max(busy, want))
+        groups[group] = (cap, max(busy, want))
+    return labels_out, groups
+
+
+def free_slots(pools_in_use, health_pools, variables, counts, stalled):
+    """({label: free}, {group: free}) for the pools the jobs use.
+
+    Fresh health: `pool_load`'s capacity minus taken, at least 0. Stale or missing health:
+    STALE_FREE per label and per group, minus what this repository's runs already hold there
+    (fail open toward speed: one job may wait on a pool we cannot see, the rest go to GitHub)."""
+    free, groups = {}, {}
+    if health_pools is None:
+        for p in pools_in_use:
+            held = counts.running.get(p.label, 0) + counts.queued.get(p.label, 0)
+            free[p.label] = max(0, STALE_FREE - held) if p.label not in stalled else 0
+            if p.group:
+                g = groups.get(p.group, _stale_group_free(p.group))
+                groups[p.group] = max(0, g - held * group_weight(p.name))
+        return free, groups
+    labels, group_load = pool_load(pools_in_use, health_pools, variables, counts, stalled)
+    for p in pools_in_use:
+        cap, taken = labels[p.label]
+        free[p.label] = max(0, cap - taken)
+    for g, (cap, taken) in group_load.items():
+        groups[g] = max(0, cap - taken)
     return free, groups
+
+
+def expected_wait(cap, taken, need, minutes):
+    """Minutes a job needing `need` units (1 slot, or its GB in a memory group) waits for a pool of
+    `cap` units of which `taken` are held or promised, when one job holds a slot `minutes` long.
+
+    Room now: 0. Else the jobs ahead drain in waves of `cap` units: the job starts in wave
+    ceil((taken + need - cap) / cap), and the first wave frees after half a job on average (we do not
+    know how far the running jobs are), so the wait is (waves - 0.5) * minutes: one slot of three,
+    all three busy and none queued, waits ~half a job; with three more queued ahead, a job and a
+    half. No capacity at all, or a job larger than the whole pool: infinite (never placed on it)."""
+    if cap <= 0 or need > cap:
+        return float("inf")
+    if cap - taken >= need:
+        return 0.0
+    waves = -(-(taken + need - cap) // cap)
+    return (waves - 0.5) * minutes
+
+
+def max_wait_thresholds(text):
+    """PICK_MAX_WAIT (`linux=10 windows=15 macos=20`, any subset, minutes >= 0) over DEFAULT_MAX_WAIT.
+    Returns ({family name: minutes}, [the entries it ignored])."""
+    out, bad = dict(DEFAULT_MAX_WAIT), []
+    for item in (text or "").replace(",", " ").split():
+        k, _, v = item.partition("=")
+        try:
+            n = float(v)
+        except ValueError:
+            n = -1
+        if k in out and n >= 0:
+            out[k] = n
+        else:
+            bad.append(item)
+    return out, bad
+
+
+def _fmt_min(m):
+    return "inf" if m == float("inf") else f"{m:.0f}" if m == int(m) else f"{m:.1f}"
 
 
 # ---- the decision ------------------------------------------------------------
 
 
-def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None):
-    """({key: runs-on}, [decision rows]). Pinned jobs first (they take their
-    slots whatever is free), then the rest in priority order: a job that needs
-    more memory than its pool holds takes its image; else our pool while it and
-    its group have a free slot, else the image; a macOS job past the macOS cap,
-    or a job whose image family is saturated on GitHub (`saturated`, from
-    `github_saturated`), waits for our pool instead, but only for a pool that is
-    merely busy (no `notes` entry). `mem` is {pool name: GB} (`mem_capacity`;
-    POOL_MEM_GB for a pool it leaves out). Followers copy their target."""
+def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None,
+             load=None, max_wait=None, records=None):
+    """({key: runs-on}, [decision rows]). Pinned jobs first (they take their slots whatever is
+    free), then the rest in priority order:
+
+    - a job that needs more memory than its pool holds takes its image;
+    - with the pools' load known (`load`, from `pool_load`: fresh or aged health), a job goes to our
+      pool unless its EXPECTED WAIT there (`job_wait`) exceeds its family's threshold (`max_wait`,
+      {linux|windows|macos: minutes}; DEFAULT_MAX_WAIT). Every job placed (free slot or waiting)
+      joins the queue the next job is measured against, so a burst of one run spreads over our
+      slots and only the jobs past the threshold overflow. An unhealthy, paused, unlisted or stalled
+      pool (`notes`) waits forever: GitHub;
+    - without the load (stale health), our pool only while it and its group have a free slot
+      (`free` / `groups`), else the image (fail open toward speed, as before);
+    - past the threshold (or with no free slot), a job of a family ops turned off (`off`) waits
+      for our pool anyway; a macOS job past the macOS cap, or a job whose image family is
+      saturated on GitHub (`saturated`), waits too, but only for a pool that is merely busy (no
+      `notes` entry), at most WAIT_DEPTH per pool.
+
+    `mem` is {pool name: GB} (`mem_capacity`; POOL_MEM_GB for a pool it leaves out). Followers copy
+    their target. Each row's `why` names the pool, the expected wait and the threshold. `records`, a
+    dict when given, gets {key: {pool, label, wait (minutes, None when not measured), threshold,
+    eligible (our pool in use, healthy, the job fits: GitHub only past the threshold)}} for every
+    unpinned job (the tripwire's input; see `tripwires`)."""
     free = dict(free)
     groups = dict(groups)
     notes, saturated = notes or {}, saturated or {}
+    thresholds = dict(DEFAULT_MAX_WAIT, **(max_wait or {}))
+    label_load_, group_load_ = ({}, {}) if load is None else ({k: list(v) for k, v in load[0].items()},
+                                                             {k: list(v) for k, v in load[1].items()})
     plan, rows = {}, {}
 
     def mem_of(p):
         return (mem or {}).get(p.name) or POOL_MEM_GB[p.name]
+
+    def group_minutes(group):
+        return max(POOL_JOB_MINUTES[n] for n in POOLS if POOLS[n][3] == group)
+
+    def job_wait(p):
+        """(minutes, what binds it: a short description) for one more job on `p`."""
+        minutes = POOL_JOB_MINUTES[p.name]
+        cap, taken = label_load_.get(p.label, (0, 0))
+        worst = (expected_wait(cap, taken, 1, minutes), f"{p.label} {taken}/{cap} slots taken")
+        if p.parent_label:
+            cap, taken = label_load_.get(p.parent_label, (0, 0))
+            w = expected_wait(cap, taken, 1, minutes)
+            if w > worst[0]:
+                worst = (w, f"{p.parent_label} {taken}/{cap} slots taken")
+        if p.group and p.group in group_load_:
+            cap, taken = group_load_[p.group]
+            unit = "GB" if p.group in GROUP_WEIGHT else "slots"
+            w = expected_wait(cap, taken, group_weight(p.name), group_minutes(p.group))
+            if w > worst[0]:
+                worst = (w, f"the {p.group} pools {taken}/{cap} {unit} taken")
+        return worst
 
     def take(p):
         free[p.label] = free.get(p.label, 0) - 1
@@ -554,6 +698,11 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
                 free[other.label] = min(free[other.label], free[p.label])
         if p.group:
             groups[p.group] = groups.get(p.group, 0) - group_weight(p.name)
+        for l in (p.label, p.parent_label):
+            if l in label_load_:
+                label_load_[l][1] += 1
+        if p.group in group_load_:
+            group_load_[p.group][1] += group_weight(p.name)
 
     for job in jobs:
         if job["follow"] or not job["pinned"]:
@@ -570,60 +719,87 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             why += f"; needs {job['mem']} GB, {p.label} holds {mem_of(p)} (may not fit)"
         rows[job["key"]] = (p.name, "ours (pinned)", why)
     hosted_macos = 0
-    waits = {}  # label -> jobs of this run that wait for it (at most WAIT_DEPTH)
+    waits = {}  # label -> jobs of this run that wait for it past the threshold (at most WAIT_DEPTH)
     for job in jobs:
         if job["follow"] or job["pinned"]:
             continue
         p = pools[job["pool"]]
         image = job["image"] or p.image
         key = job["key"]
+        family = image_family(image)
+        fname = FAMILY_NAME.get(family or image_family(p.image), "linux")
+        limit = thresholds.get(fname, 0)
         if fork_pr:
             plan[key], rows[key] = image, (p.name, "GitHub", "a fork's pull request never runs on our runners")
-        elif p.mode == "off":
+            continue
+        if p.mode == "off":
             plan[key], rows[key] = image, (p.name, "GitHub", f"{POOLS[p.name][0]} is unset")
-        elif p.mode == "image":
+            continue
+        if p.mode == "image":
             # the job's own @image wins (a leg keeps the image its build ran on)
             plan[key], rows[key] = job["image"] or p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
-        elif job["mem"] and job["mem"] > mem_of(p):
+            continue
+        if job["mem"] and job["mem"] > mem_of(p):
             # our pool cannot hold the job (the linux-arm64 OOM): GitHub's image whatever is free
             if p.macos:
                 hosted_macos += 1
             plan[key], rows[key] = image, (p.name, "GitHub", f"needs {job['mem']} GB, {p.label} holds {mem_of(p)}")
-        elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) >= group_weight(p.name)) and (
-            p.parent_label not in free or free[p.parent_label] > 0
-        ):
+            continue
+        if records is not None:
+            records[key] = {"pool": p.name, "label": p.label, "wait": None, "threshold": limit,
+                            "eligible": load is not None and not notes.get(p.label)}
+        if load is not None:
+            wait, binding = job_wait(p) if not notes.get(p.label) else (float("inf"), notes[p.label])
+            if records is not None and wait != float("inf"):
+                records[key]["wait"] = round(wait, 1)
+            room = wait == 0
+            within = wait <= limit
+            stat = f"expected wait {_fmt_min(wait)} min ({binding}; ~{POOL_JOB_MINUTES[p.name]} min/job), threshold {_fmt_min(limit)} min"
+        else:
+            room = free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) >= group_weight(p.name)) and (
+                p.parent_label not in free or free[p.parent_label] > 0)
+            within = room
+            stat = "health stale: free slot only" + ("" if room else ", none free")
+        if room:
             take(p)
-            plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}")
-        elif image_family(image) in (off or set()):
+            plan[key], rows[key] = p.runs_on, (p.name, "ours", f"free slot on {p.label}; {stat}")
+        elif within:
+            take(p)
+            plan[key], rows[key] = p.runs_on, (p.name, "ours (waits)", f"{stat}: within it, ours")
+        elif family in (off or set()):
             # ops turned GitHub's family off: wait for our pool, no depth limit, never GitHub
-            plan[key], rows[key] = p.runs_on, (p.name, "ours (waits)", f"GitHub {image_family(image)} is off (ops switch)")
+            take(p)
+            plan[key], rows[key] = p.runs_on, (p.name, "ours (waits)", f"GitHub {family} is off (ops switch); {stat}")
         elif p.macos and hosted_macos >= macos_cap and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
             waits[p.label] = waits.get(p.label, 0) + 1
+            take(p)
             # GitHub's macOS share is spent: wait for our pool, but only for a pool that is
             # merely busy (never one that is unhealthy, paused, unlisted or stalled).
             plan[key], rows[key] = p.runs_on, (
                 p.name,
                 "ours (waits)",
-                f"no free slot, but this run already sent {hosted_macos} macOS job(s) to GitHub (cap {macos_cap})",
+                f"{stat}, but this run already sent {hosted_macos} macOS job(s) to GitHub (cap {macos_cap})",
             )
-        elif image_family(image) in saturated and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
+        elif family in saturated and not notes.get(p.label) and waits.get(p.label, 0) < WAIT_DEPTH:
             waits[p.label] = waits.get(p.label, 0) + 1
+            take(p)
             # GitHub has had a job of this family queued for minutes: our busy pool frees sooner.
             # Not counted against the macOS cap (the job does not go to GitHub).
-            family = image_family(image)
-            busy = "no free slot" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full"
             plan[key], rows[key] = p.runs_on, (
                 p.name,
                 "ours (waits)",
-                f"{busy}, but GitHub's {family} images have had a job queued for"
+                f"{stat}, but GitHub's {family} images have had a job queued for"
                 f" {saturated[family] // 60} min (saturated)",
             )
         else:
             if p.macos:
                 hosted_macos += 1
-            why = notes.get(p.label) or (
-                f"no free slot on {p.label}" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full"
-            )
+            if notes.get(p.label):
+                why = notes[p.label]
+            elif load is not None:
+                why = f"{stat}: exceeds it, GitHub"
+            else:
+                why = (f"no free slot on {p.label}" if free.get(p.label, 0) <= 0 else f"the {p.group} pools are full") + f" ({stat})"
             if waits.get(p.label, 0) >= WAIT_DEPTH:
                 why += f" ({WAIT_DEPTH} job(s) of this run already wait for it)"
             plan[key], rows[key] = image, (p.name, "GitHub", why)
@@ -634,6 +810,23 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             rows[job["key"]] = ("~" + target, "same as " + target, "starts in its slot")
     ordered = [j["key"] for j in jobs]
     return {k: plan[k] for k in ordered}, [(k, *rows[k], plan[k]) for k in ordered]
+
+
+def tripwires(plan, records):
+    """The jobs placed on a GitHub image although our pool for them was healthy and their expected
+    wait there was within the threshold: [{key, pool, label, wait, threshold}]. The decision rules
+    never do that (a job within the threshold always takes our pool); this is the independent check
+    that they still don't, so a placement like the 4.20.1 gate's (coverage shards on ubuntu-latest
+    beside an idle pool) is an error in the log, never silent."""
+    out = []
+    for key, r in (records or {}).items():
+        runs_on = plan.get(key)
+        if not (isinstance(runs_on, str) and GITHUB_IMAGE.match(runs_on)):
+            continue
+        if r.get("eligible") and r.get("wait") is not None and r["wait"] <= r["threshold"]:
+            out.append({"key": key, "pool": r["pool"], "label": r["label"], "wait": r["wait"],
+                        "threshold": r["threshold"]})
+    return out
 
 
 def fallback_plan(jobs, pools, fork_pr):
@@ -849,13 +1042,34 @@ def is_fork_pr(env):
     return head != env.get("GITHUB_REPOSITORY")
 
 
-LAST = {"blocked": [], "saturated": {}}  # side output of the latest pick() (kept out of its return value)
+# Side output of the latest pick() (kept out of its return value): `decisions` {key: record} (see
+# `allocate`'s `records`, with the pool's numbers at pick time) and `tripwire` (`tripwires`, each with
+# the run and those numbers, plus any job the picker-error fallback sent to GitHub from a pool in use).
+LAST = {"blocked": [], "saturated": {}, "decisions": {}, "tripwire": []}
+
+
+def pool_numbers(label, health, counts):
+    """The pool's state at pick time, for the decision log and the tripwire: the fleet's slots,
+    healthy_slots, busy and queued for `label` (None when not published) and this picker's own
+    counts (this repository's running / queued jobs, the org's busy runners)."""
+    e = (health or {}).get(label)
+    e = e if isinstance(e, dict) else {}
+    out = {k: _n(e.get(k)) for k in ("slots", "healthy_slots", "busy", "queued")}
+    out["ok"] = e.get("ok") is True and e.get("paused") is not True
+    if counts is not None:
+        out["repo_running"] = counts.running.get(label, 0)
+        out["repo_queued"] = counts.queued.get(label, 0)
+        if counts.busy_runners is not None:
+            out["busy_runners"] = counts.busy_runners.get(label, 0)
+    return out
 
 
 def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=time.sleep,
          clock=time.monotonic):
     """(plan, rows, free) for the environment `env` (see the module docstring)."""
-    LAST["blocked"], LAST["saturated"] = [], {}
+    LAST["blocked"], LAST["saturated"], LAST["decisions"], LAST["tripwire"] = [], {}, {}, []
+    run_ref = {"repo": env.get("GITHUB_REPOSITORY", ""), "run_id": env.get("GITHUB_RUN_ID", ""),
+               "attempt": env.get("GITHUB_RUN_ATTEMPT", "1")}
     now = time.time() if now is None else now
     jobs, bad = parse_jobs(env.get("PICK_JOBS"))
     for entry in bad:
@@ -873,6 +1087,9 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         macos_cap = max(0, int(env.get("PICK_MACOS_CAP") or DEFAULT_MACOS_CAP))
     except ValueError:
         macos_cap = DEFAULT_MACOS_CAP
+    max_wait, bad_wait = max_wait_thresholds(env.get("PICK_MAX_WAIT"))
+    for entry in bad_wait:
+        warn(f"pick-runners: ignored the malformed PICK_MAX_WAIT entry {entry!r}")
     in_use = [p for p in pools.values() if p.mode == "ours"]
     pinned_only = all(j["pinned"] or j["follow"] for j in jobs)
     health = fresh_health(variables.get("DENEXT_POOL_HEALTH"), now)
@@ -950,18 +1167,37 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
             health = {l: ({k: v for k, v in e.items() if k not in ("busy", "queued")} if isinstance(e, dict) else e)
                       for l, e in health.items()}
         free, groups = free_slots(in_use, health, variables, counts, stalled)
+        load = pool_load(in_use, health, variables, counts, stalled)
         notes = {p.label: pool_note(p.label, health, stalled) for p in in_use}
+        records = {}
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
-                              github_off(variables.get("DENEXT_POOL_HEALTH"), now))
+                              github_off(variables.get("DENEXT_POOL_HEALTH"), now),
+                              None if load[0] is None else load, max_wait, records)
         LAST["blocked"] = sorted(l for l, n in notes.items() if n)
+        for key, r in records.items():
+            r["runs_on"] = plan[key]
+            r["numbers"] = pool_numbers(r["label"], health, counts)
+        LAST["decisions"] = records
+        LAST["tripwire"] = [dict(t, **run_ref, numbers=records[t["key"]]["numbers"])
+                            for t in tripwires(plan, records)]
         return plan, rows, free
     except Exception as e:  # never fail the run
         warn(f"pick-runners: {e}; every job but the pinned ones takes its GitHub image")
         plan = fallback_plan(jobs, pools, False)
+        # Loud, not silent: each job this sends to GitHub from a pool in use is a tripwire (the wait
+        # was never measured, so the pool may well have been idle).
+        LAST["tripwire"] = [
+            dict(run_ref, key=j["key"], pool=j["pool"], label=pools[j["pool"]].label, wait=None,
+                 threshold=max_wait.get(FAMILY_NAME.get(image_family(pools[j["pool"]].image), "linux")),
+                 reason=f"picker error: {e}"[:200], numbers=pool_numbers(pools[j["pool"]].label, health, None))
+            for j in jobs
+            if not j["follow"] and not j["pinned"] and pools[j["pool"]].mode == "ours"
+            and isinstance(plan.get(j["key"]), str) and GITHUB_IMAGE.match(plan[j["key"]])
+        ]
         return plan, [(k, "?", "GitHub", "picker error", v) for k, v in plan.items()], {}
 
 
-def table(rows, free, saturated=None):
+def table(rows, free, saturated=None, tripwire=None):
     lines = ["| job | pool | decision | why | runs-on |", "| --- | --- | --- | --- | --- |"]
     for key, pool, decision, why, runs_on in rows:
         lines.append(f"| {key} | {pool} | {decision} | {why} | `{_dumps(runs_on)}` |")
@@ -972,6 +1208,11 @@ def table(rows, free, saturated=None):
         lines.append("")
         lines.append("GitHub saturated: " + ", ".join(
             f"{f} (queued {s // 60} min)" for f, s in sorted(saturated.items())))
+    if tripwire:
+        lines.append("")
+        lines.append("**TRIPWIRE: on GitHub although our pool was healthy within the threshold:** " + ", ".join(
+            f"{t['key']} ({t['label']}, wait {'unmeasured' if t.get('wait') is None else t['wait']} min)"
+            for t in tripwire))
     return "\n".join(lines)
 
 
@@ -997,12 +1238,24 @@ def main(argv):
     print(f"free={_dumps(free)}")
     print(f"blocked={_dumps(LAST['blocked'])}")
     print(f"saturated={_dumps(sorted(LAST['saturated']))}")
-    print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free, LAST["saturated"]), file=sys.stderr)
+    print(f"tripwire={_dumps(LAST['tripwire'])}")
+    # One machine-readable line per job (a log scraper or the watchdog greps `pick-runners decision `).
+    for key, r in LAST["decisions"].items():
+        print(f"pick-runners decision {_dumps(dict(r, key=key))}", file=sys.stderr)
+    for t in LAST["tripwire"]:
+        n = {k: ("?" if v is None else v) for k, v in (t.get("numbers") or {}).items()}
+        wait = "unmeasured" if t.get("wait") is None else f"{t['wait']} min"
+        print(f"::error title=pick-runners tripwire::{t['repo']} run {t['run_id']} (attempt {t['attempt']}) job"
+              f" {t['key']} went to GitHub while {t['label']} was healthy with expected wait {wait}"
+              f" (threshold {t['threshold']} min; slots {n.get('healthy_slots', '?')}, busy"
+              f" {n.get('busy')}, queued {n.get('queued')})" + (f": {t['reason']}" if t.get("reason") else ""),
+              file=sys.stderr)
+    print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free, LAST["saturated"], LAST["tripwire"]), file=sys.stderr)
     summary = env.get("GITHUB_STEP_SUMMARY")
     if summary and not dry:
         try:
             with open(summary, "a", encoding="utf-8") as f:
-                f.write("### Runner picks\n\n" + table(rows, free, LAST["saturated"]) + "\n")
+                f.write("### Runner picks\n\n" + table(rows, free, LAST["saturated"], LAST["tripwire"]) + "\n")
         except OSError:
             pass
     return 0
