@@ -1,8 +1,8 @@
 name: Pick runners
 description: >-
-  Our self-hosted pools first, GitHub-hosted for the overflow: each job of the run goes to our pool
-  only while it has a free slot (from the fleet's DENEXT_POOL_HEALTH and the queued jobs), else to
-  the GitHub image at once. See pick_runners.py for the rules.
+  Our self-hosted pools first, GitHub-hosted only as the backup: each job of the run goes to our pool
+  unless its expected wait there (slots, busy, queued and this run's own placements, from the fleet's
+  DENEXT_POOL_HEALTH) exceeds its family's threshold. See pick_runners.py for the rules.
 inputs:
   jobs:
     description: >-
@@ -21,6 +21,11 @@ inputs:
     default: ${{ github.token }}
   runner-token:
     description: "Optional token that may list the org's self-hosted runners (RUNNER_STATUS_TOKEN)."
+    default: ""
+  max-wait:
+    description: >-
+      Per-family thresholds in minutes: a job goes to GitHub only when its expected wait on our pool exceeds
+      its family's (any subset of `linux=10 windows=15 macos=20`, the defaults; 0 = free slot or GitHub).
     default: ""
   macos-cap:
     description: "The most macOS jobs this run sends to GitHub (GitHub runs ~5 for the whole org)."
@@ -47,6 +52,11 @@ outputs:
   saturated:
     description: "GitHub image families (macos, windows, ubuntu) whose queue was saturated, as a JSON array: their jobs waited for our busy pool."
     value: ${{ steps.pick.outputs.saturated }}
+  tripwire:
+    description: >-
+      Jobs sent to GitHub although our healthy pool's expected wait was within the threshold, as JSON (each with the
+      run, the pool's slots / busy / queued and the wait); `[]` when the rule held. Each is also an error annotation.
+    value: ${{ steps.pick.outputs.tripwire }}
 runs:
   using: composite
   steps:
@@ -56,6 +66,7 @@ runs:
         PICK_JOBS: ${{ inputs.jobs }}
         PICK_VARS: ${{ inputs.vars }}
         PICK_MACOS_CAP: ${{ inputs.macos-cap }}
+        PICK_MAX_WAIT: ${{ inputs.max-wait }}
         PICK_DRY_RUN: ${{ inputs.dry-run }}
         PICK_SETTLE: ${{ inputs.settle }}
         PICK_RUNNER_TOKEN: ${{ inputs.runner-token }}

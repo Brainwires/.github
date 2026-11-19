@@ -31,11 +31,18 @@ def health(pools, age=60):
     return json.dumps({"v": 1, "checked_at": NOW - age, "pools": pools})
 
 
-def env(jobs, health_value=None, **variables):
+# The suites below that predate the expected wait pin every threshold to 0 (the old rule: a free slot
+# or GitHub), so they keep testing the slot counting, the caps and the switches on their own;
+# ExpectedWaitTest and BurstTest run with the real defaults (max_wait=None).
+OLD_RULE = "linux=0 windows=0 macos=0"
+
+
+def env(jobs, health_value=None, max_wait=OLD_RULE, **variables):
     v = dict(variables)
     if health_value is not None:
         v["DENEXT_POOL_HEALTH"] = health_value
-    return {
+    out = {} if max_wait is None else {"PICK_MAX_WAIT": max_wait}
+    return out | {
         "PICK_JOBS": jobs,
         "PICK_VARS": json.dumps(v),
         "GITHUB_REPOSITORY": "Brainwires/denext",
@@ -114,7 +121,8 @@ class FreeSlotTest(unittest.TestCase):
         h = health({"denext-windows-x64": entry(2, busy=2)})
         plan, rows, _, _ = run(env("a=windows-x64 b=windows-x64", h, RUNNER_WINDOWS_X64=WIN))
         self.assertEqual(plan, {"a": "windows-latest", "b": "windows-latest"})
-        self.assertIn("no free slot", rows[0][3])
+        self.assertIn("denext-windows-x64 2/2 slots taken", rows[0][3])
+        self.assertIn("exceeds it", rows[0][3])
 
     def test_queued_counts_against_free(self):
         h = health({"denext-windows-x64": entry(2, busy=0, queued=1)})
@@ -200,7 +208,7 @@ class MiniHostTest(unittest.TestCase):
         plan, rows, free, _ = run(env("build=linux-arm64@ubuntu-22.04-arm", health(self.pools(mac=2)), **self.VARS))
         self.assertEqual(free["denext-linux-arm64"], 1)
         self.assertEqual(plan, {"build": "ubuntu-22.04-arm"})
-        self.assertIn("mini-host pools are full", rows[0][3])
+        self.assertIn("the mini-host pools 16/16 GB taken", rows[0][3])
 
     def test_one_macos_vm_leaves_room_for_one_more_job(self):
         h = health(self.pools(mac=1))
@@ -981,6 +989,293 @@ class SaturatedOutputTest(unittest.TestCase):
         lines = dict(l.split("=", 1) for l in out.stdout.splitlines())
         self.assertEqual(json.loads(lines["saturated"]), [])
         self.assertNotIn("GitHub saturated", out.stderr)
+
+
+LINUX2204 = '["self-hosted","denext-linux-x64-2204"]'
+WINARM = '["self-hosted","denext-windows-arm64"]'
+ARM = '["self-hosted","denext-linux-arm64"]'
+
+
+def records_of(e, **kw):
+    """pick() with the real thresholds; (plan, rows, LAST['decisions'], LAST['tripwire'])."""
+    plan, rows, _, warnings = run(e, **kw)
+    return plan, rows, pr.LAST["decisions"], pr.LAST["tripwire"]
+
+
+def assert_ours_first(test, plan, decisions):
+    """The rule itself: a job goes to GitHub only when its measured wait exceeds its threshold (or it
+    was not measurable: an unhealthy pool), and every job within the threshold is on our pool."""
+    for key, r in decisions.items():
+        hosted = isinstance(plan[key], str) and pr.GITHUB_IMAGE.match(plan[key])
+        if hosted:
+            test.assertTrue(r["wait"] is None or r["wait"] > r["threshold"], (key, r))
+        if r["eligible"] and r["wait"] is not None and r["wait"] <= r["threshold"]:
+            test.assertFalse(hosted, (key, r))
+    # (a job past its threshold may still be ours: the macOS cap, saturation or the github-off switch)
+
+
+class ExpectedWaitTest(unittest.TestCase):
+    """Ours first: a job goes to GitHub only when its expected wait on our pool exceeds its family's
+    threshold (Linux 10 min, Windows 15, macOS 20)."""
+
+    def test_the_wait_formula(self):
+        inf = float("inf")
+        self.assertEqual(pr.expected_wait(3, 0, 1, 10), 0)
+        self.assertEqual(pr.expected_wait(3, 2, 1, 10), 0)
+        self.assertEqual(pr.expected_wait(3, 3, 1, 10), 5)  # all busy: half a job
+        self.assertEqual(pr.expected_wait(3, 5, 1, 10), 5)  # two queued ahead: still the first wave
+        self.assertEqual(pr.expected_wait(3, 6, 1, 10), 15)  # three ahead: the second wave
+        self.assertEqual(pr.expected_wait(16, 16, 6, 30), 15)  # memory: two VMs hold the host
+        self.assertEqual(pr.expected_wait(0, 0, 1, 10), inf)
+        self.assertEqual(pr.expected_wait(4, 0, 8, 10), inf)
+
+    def test_thresholds_parse(self):
+        got, bad = pr.max_wait_thresholds("linux=5, macos=0 windows=x nope=3 junk")
+        self.assertEqual(got, {"linux": 5, "windows": 15, "macos": 0})
+        self.assertEqual(bad, ["windows=x", "nope=3", "junk"])
+        self.assertEqual(pr.max_wait_thresholds("")[0], pr.DEFAULT_MAX_WAIT)
+        _, _, _, warnings = run(env("a=windows-x64", health({"denext-windows-x64": entry(1)}), max_wait="windows=-1",
+                                    RUNNER_WINDOWS_X64=WIN))
+        self.assertTrue(any("PICK_MAX_WAIT" in w for w in warnings))
+
+    def test_the_4_20_1_gate(self):
+        # Brainwires/denext run 44537985240: 12 Linux jobs at once; the Linux host's three shared slots
+        # idle. The old rule sent the 9 past the free slots to ubuntu-latest at once. Now 3 start, 3
+        # more wait ~5 min for the first to end, and only the jobs past the 10-min threshold overflow.
+        keys = ["coverage_1"] + [f"coverage_{i}" for i in range(2, 7)] + [
+            "backend_integration", "check", "integration", "next_compat", "bundle_budget", "cargo_audit"]
+        jobs = "coverage_1=linux-x64-docker " + " ".join(f"{k}=linux-x64" for k in keys[1:]) + (
+            " windows_tests=windows-x64-fast windows_resolve=windows-x64 macos_tests=macos-arm64")
+        h = health({"denext-linux-x64": entry(3), "denext-linux-x64-2204": entry(3), "denext-linux-x64-docker": entry(1),
+                    "denext-windows-x64": entry(2), "denext-windows-x64-fast": entry(1), "denext-macos-arm64": entry(2)})
+        plan, rows, decisions, trip = records_of(env(jobs, h, max_wait=None, RUNNER_LINUX_X64=LINUX, RUNNER_LINUX_X64_DOCKER=DOCKER,
+                                                     RUNNER_LINUX_X64_SHARED_SLOTS="3", RUNNER_WINDOWS_X64=WIN,
+                                                     RUNNER_MACOS_ARM=MAC))
+        ours_linux = [k for k in keys if plan[k] != "ubuntu-latest"]
+        self.assertEqual(ours_linux, keys[:6])
+        self.assertEqual([r[2] for r in rows[:6]], ["ours"] * 3 + ["ours (waits)"] * 3)
+        self.assertIn("expected wait 5 min", rows[3][3])
+        self.assertIn("threshold 10 min", rows[3][3])
+        self.assertIn("expected wait 15 min", rows[6][3])
+        self.assertIn("exceeds it", rows[6][3])
+        self.assertEqual(plan["windows_tests"], ["self-hosted", "denext-windows-x64-fast"])
+        self.assertEqual(plan["windows_resolve"], ours(WIN))
+        self.assertEqual(plan["macos_tests"], ours(MAC))
+        self.assertEqual(trip, [])
+        assert_ours_first(self, plan, decisions)
+
+    def test_a_busy_pool_within_the_threshold_waits(self):
+        h = health({"denext-windows-x64": entry(2, busy=2)})
+        plan, rows, decisions, _ = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertEqual(rows[0][2], "ours (waits)")
+        self.assertIn("denext-windows-x64 2/2 slots taken", rows[0][3])
+        self.assertEqual(decisions["a"]["wait"], 10)
+        self.assertEqual(decisions["a"]["threshold"], 15)
+
+    def test_a_long_queue_overflows(self):
+        # busy and queued overlap (a booting runner's job is both): 4 queued on 2 busy slots is 2 ahead
+        h = health({"denext-windows-x64": entry(2, busy=2, queued=4)})
+        plan, rows, _, _ = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": "windows-latest"})
+        self.assertIn("expected wait 30 min", rows[0][3])
+
+    def test_the_threshold_is_configurable(self):
+        h = health({"denext-windows-x64": entry(2, busy=2, queued=4)})
+        plan, _, _, _ = records_of(env("a=windows-x64", h, max_wait="windows=30", RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": ours(WIN)})
+
+    def test_unhealthy_paused_unlisted_go_to_github(self):
+        for pools in ({"denext-windows-x64": dict(entry(2, ok=False), reason="guest unreachable")},
+                      {"denext-windows-x64": entry(2, paused=True)}, {}):
+            plan, rows, decisions, trip = records_of(env("a=windows-x64", health(pools), max_wait=None,
+                                                         RUNNER_WINDOWS_X64=WIN))
+            self.assertEqual(plan, {"a": "windows-latest"}, pools)
+            self.assertFalse(decisions["a"]["eligible"])
+            self.assertEqual(trip, [])
+
+    def test_a_long_job_on_the_busy_fast_host_goes_to_github_not_the_slow_host(self):
+        h = health({"denext-windows-x64": entry(2, busy=1), "denext-windows-x64-fast": entry(1, busy=1)})
+        plan, rows, _, _ = records_of(env("t=windows-x64-fast", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"t": "windows-latest"})  # ~60-min jobs: half of one is past 15 min
+        self.assertIn("denext-windows-x64-fast 1/1 slots taken", rows[0][3])
+
+    def test_the_mac_host_memory_counts_in_the_wait(self):
+        h = health({"denext-macos-arm64": entry(2, busy=2), "denext-linux-arm64": entry(1), "denext-windows-arm64": entry(2)})
+        e = env("build=linux-arm64@ubuntu-22.04-arm lint=macos-arm64", h, max_wait=None, RUNNER_LINUX_ARM64=ARM,
+                RUNNER_MACOS_ARM=MAC, RUNNER_WINDOWS_ARM=WINARM)
+        plan, rows, _, _ = records_of(e)
+        # two VMs hold the host's 16 GB: ~15 min for the Linux job (past 10), within macOS's 20
+        self.assertEqual(plan, {"build": "ubuntu-22.04-arm", "lint": ours(MAC)})
+        self.assertIn("the mini-host pools 16/16 GB taken", rows[0][3])
+
+    def test_label_equivalence_is_not_assumed(self):
+        # linux-x64 and linux-x64-2204 are the same three containers (another image): an idle 2204
+        # label is no free capacity, and a linux-x64 job never runs on the 22.04 image.
+        h = health({"denext-linux-x64": entry(3, busy=3), "denext-linux-x64-2204": entry(3)})
+        plan, rows, _, _ = records_of(env("a=linux-x64", h, max_wait=None, RUNNER_LINUX_X64=LINUX,
+                                          RUNNER_LINUX_X64_2204=LINUX2204))
+        self.assertEqual(plan, {"a": ours(LINUX)})
+        self.assertEqual(rows[0][2], "ours (waits)")
+
+    def test_stale_health_keeps_the_free_slot_rule(self):
+        h = health({"denext-windows-x64": entry(9)}, age=11 * 60)
+        plan, rows, decisions, trip = records_of(env("a=windows-x64 b=windows-x64", h, max_wait=None,
+                                                     RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": ours(WIN), "b": "windows-latest"})
+        self.assertIn("health stale", rows[1][3])
+        self.assertIsNone(decisions["b"]["wait"])
+        self.assertEqual(trip, [])
+
+    def test_an_aged_value_measures_the_wait(self):
+        h = health({"denext-windows-x64": entry(2, busy=2)}, age=20 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        plan, rows, _, _ = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN), get=api)
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertIn("expected wait 10 min", rows[0][3])
+
+
+class BurstTest(unittest.TestCase):
+    VARS = {"RUNNER_LINUX_X64": LINUX, "RUNNER_LINUX_X64_DOCKER": DOCKER, "RUNNER_LINUX_X64_SHARED_SLOTS": "3",
+            "RUNNER_WINDOWS_X64": WIN, "RUNNER_MACOS_ARM": MAC}
+
+    def jobs(self, n=30):
+        pools = ["linux-x64", "windows-x64", "macos-arm64", "linux-x64-docker", "linux-x64"]
+        return " ".join(f"j{i}={pools[i % len(pools)]}" for i in range(n))
+
+    def test_a_burst_of_30_against_pools_that_free_soon(self):
+        # every pool full right now but nothing queued: the first jobs of each wait ~half a job
+        h = health({"denext-linux-x64": entry(3, busy=3), "denext-linux-x64-docker": entry(1, busy=0),
+                    "denext-windows-x64": entry(2, busy=2), "denext-macos-arm64": entry(2, busy=2)})
+        plan, rows, decisions, trip = records_of(env(self.jobs(), h, max_wait=None, **self.VARS))
+        assert_ours_first(self, plan, decisions)
+        self.assertEqual(trip, [])
+        hosted = {k for k, v in plan.items() if isinstance(v, str)}
+        # Linux: 3 shared slots busy -> the next 3 jobs wait 5 min, the rest 15+ (past 10)
+        linux = [k for k, r in decisions.items() if r["pool"].startswith("linux")]
+        self.assertEqual(len([k for k in linux if k not in hosted]), 3)
+        # Windows 2 busy: two wait 10 min (within 15), the third 30
+        win = [k for k, r in decisions.items() if r["pool"] == "windows-x64"]
+        self.assertEqual([k in hosted for k in win], [False, False] + [True] * (len(win) - 2))
+        # macOS 2 VMs busy: two wait (10 min on the label, 15 on the host's memory; within 20)
+        mac = [k for k, r in decisions.items() if r["pool"] == "macos-arm64"]
+        self.assertEqual([k in hosted for k in mac][:2], [False, False])
+        for key, _, decision, why, _ in rows:
+            self.assertRegex(why, r"expected wait [0-9.inf]+ min .*threshold [0-9.]+ min", key)
+
+    def test_a_burst_of_30_on_idle_pools_spreads_before_overflowing(self):
+        h = health({"denext-linux-x64": entry(3), "denext-linux-x64-docker": entry(1),
+                    "denext-windows-x64": entry(2), "denext-macos-arm64": entry(2)})
+        plan, _, decisions, trip = records_of(env(self.jobs(), h, max_wait=None, **self.VARS))
+        assert_ours_first(self, plan, decisions)
+        self.assertEqual(trip, [])
+        win = [k for k, r in decisions.items() if r["pool"] == "windows-x64"]
+        # 2 free, 2 more wait 10 min, then 30: four on our pool
+        self.assertEqual(sum(1 for k in win if not isinstance(plan[k], str)), 4)
+        linux = [k for k, r in decisions.items() if r["pool"].startswith("linux")]
+        self.assertEqual(sum(1 for k in linux if not isinstance(plan[k], str)), 6)
+
+    def test_a_burst_of_30_with_github_off_never_goes_to_github(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - 60, "github_off": ["macos", "ubuntu", "windows"],
+                        "pools": {"denext-linux-x64": entry(3, busy=3), "denext-linux-x64-docker": entry(1, busy=1),
+                                  "denext-windows-x64": entry(2, busy=2), "denext-macos-arm64": entry(2, busy=2)}})
+        plan, _, _, trip = records_of(env(self.jobs(), h, max_wait=None, **self.VARS))
+        self.assertFalse([k for k, v in plan.items() if isinstance(v, str)])
+        self.assertEqual(trip, [])
+
+    def test_macos_past_its_threshold_still_obeys_the_cap_and_the_switch(self):
+        h = health({"denext-macos-arm64": entry(2, busy=2, queued=4)})
+        e = env(" ".join(f"m{i}=macos-arm64" for i in range(5)), h, max_wait=None, RUNNER_MACOS_ARM=MAC)
+        e["PICK_MACOS_CAP"] = "2"
+        plan, _, _, _ = records_of(e)
+        self.assertEqual(list(plan.values()), ["macos-latest"] * 2 + [ours(MAC)] * 2 + ["macos-latest"])
+        off = json.dumps({"v": 1, "checked_at": NOW - 60, "github_off": ["macos"],
+                          "pools": {"denext-macos-arm64": entry(2, busy=2, queued=40)}})
+        plan, _, _, _ = records_of(env(" ".join(f"m{i}=macos-arm64" for i in range(5)), off, max_wait=None,
+                                       RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(list(plan.values()), [ours(MAC)] * 5)
+
+
+class TripwireTest(unittest.TestCase):
+    def test_flags_a_github_placement_within_the_threshold(self):
+        records = {"a": {"pool": "linux-x64", "label": "denext-linux-x64", "wait": 5.0, "threshold": 10, "eligible": True},
+                   "b": {"pool": "linux-x64", "label": "denext-linux-x64", "wait": 15.0, "threshold": 10, "eligible": True},
+                   "c": {"pool": "linux-x64", "label": "denext-linux-x64", "wait": 0.0, "threshold": 10, "eligible": False},
+                   "d": {"pool": "linux-x64", "label": "denext-linux-x64", "wait": 0.0, "threshold": 10, "eligible": True}}
+        plan = {"a": "ubuntu-latest", "b": "ubuntu-latest", "c": "ubuntu-latest", "d": ours(LINUX)}
+        self.assertEqual([t["key"] for t in pr.tripwires(plan, records)], ["a"])
+
+    def test_a_correct_pick_has_none_and_logs_each_decision(self):
+        h = health({"denext-windows-x64": entry(1, busy=1, queued=3)})
+        plan, _, decisions, trip = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual(plan, {"a": "windows-latest"})
+        self.assertEqual(trip, [])
+        self.assertEqual(decisions["a"]["numbers"]["busy"], 1)
+        self.assertEqual(decisions["a"]["numbers"]["queued"], 3)
+        self.assertEqual(decisions["a"]["runs_on"], "windows-latest")
+
+    def test_a_rule_that_regresses_trips_it(self):
+        # Simulate the old rule's bug: a decision that sends an in-threshold job to GitHub.
+        orig = pr.allocate
+
+        def buggy(*a, **kw):
+            plan, rows = orig(*a, **kw)
+            return {k: "windows-latest" for k in plan}, rows
+        pr.allocate = buggy
+        try:
+            h = health({"denext-windows-x64": entry(2, busy=1, queued=0)})
+            _, _, _, trip = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        finally:
+            pr.allocate = orig
+        self.assertEqual(len(trip), 1)
+        t = trip[0]
+        self.assertEqual((t["key"], t["label"], t["wait"], t["threshold"]), ("a", "denext-windows-x64", 0.0, 15))
+        self.assertEqual((t["repo"], t["run_id"]), ("Brainwires/denext", "100"))
+        self.assertEqual((t["numbers"]["slots"], t["numbers"]["busy"], t["numbers"]["queued"]), (2, 1, 0))
+
+    def test_the_picker_error_fallback_trips_it(self):
+        orig = pr.free_slots
+        pr.free_slots = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            plan, _, _, trip = records_of(env("a=windows-x64 b=windows-arm64! c=linux-x64", health({}),
+                                              max_wait=None, RUNNER_WINDOWS_X64=WIN))
+        finally:
+            pr.free_slots = orig
+        self.assertEqual([t["key"] for t in trip], ["a"])  # c's pool is not in use; b is pinned
+        self.assertIsNone(trip[0]["wait"])
+        self.assertIn("boom", trip[0]["reason"])
+
+    def test_the_cli_prints_an_error_annotation_and_the_output(self):
+        import contextlib
+        import io
+        from unittest import mock
+        trip = [{"key": "a", "pool": "windows-x64", "label": "denext-windows-x64", "wait": 0.0, "threshold": 15,
+                 "repo": "Brainwires/denext", "run_id": "100", "attempt": "1",
+                 "numbers": {"slots": 2, "healthy_slots": 2, "busy": 1, "queued": 0}}]
+        out, err = io.StringIO(), io.StringIO()
+        e = env("a=windows-x64", health({"denext-windows-x64": entry(2, busy=1)}), max_wait=None,
+                RUNNER_WINDOWS_X64=WIN, PICK_DRY_RUN="true")
+        e["PICK_DRY_RUN"] = "true"
+        with mock.patch.dict(os.environ, e, clear=False), mock.patch.object(pr, "tripwires", lambda *a: trip), \
+                mock.patch.object(pr.time, "time", lambda: NOW), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            pr.main([])
+        lines = dict(l.split("=", 1) for l in out.getvalue().splitlines())
+        self.assertEqual(json.loads(lines["tripwire"])[0]["key"], "a")
+        self.assertIn("::error title=pick-runners tripwire::Brainwires/denext run 100 (attempt 1) job a went to GitHub"
+                      " while denext-windows-x64 was healthy with expected wait 0.0 min (threshold 15 min; slots 2,"
+                      " busy 1, queued ?)", err.getvalue())
+        self.assertIn("TRIPWIRE", err.getvalue())
+        self.assertIn('pick-runners decision {"pool":"windows-x64"', err.getvalue())
+
+    def test_the_cli_prints_an_empty_tripwire(self):
+        e = dict(os.environ)
+        e.update(env("a=windows-x64", "", RUNNER_WINDOWS_X64=WIN))
+        e["PICK_DRY_RUN"] = "true"
+        out = subprocess.run([sys.executable, "-I", pr.__file__], env=e, capture_output=True, text=True, check=True)
+        lines = dict(l.split("=", 1) for l in out.stdout.splitlines())
+        self.assertEqual(json.loads(lines["tripwire"]), [])
+        self.assertNotIn("tripwire::", out.stderr)
 
 
 if __name__ == "__main__":
