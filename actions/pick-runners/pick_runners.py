@@ -92,12 +92,12 @@ POOLS = {
     # i3 2C/4T) serves only the shared label and runs a 65-72 min job in 80-95 min. Switched by
     # RUNNER_WINDOWS_X64; its slot is one of windows-x64's (SUBPOOL_OF).
     "windows-x64-fast": ("RUNNER_WINDOWS_X64", "denext-windows-x64-fast", "windows-latest", None, False),
-    "windows-arm64": ("RUNNER_WINDOWS_ARM", "denext-windows-arm64", "windows-11-arm", None, False),
-    "macos-arm64": ("RUNNER_MACOS_ARM", "denext-macos-arm64", "macos-latest", None, True),
+    "windows-arm64": ("RUNNER_WINDOWS_ARM", "denext-windows-arm64", "windows-11-arm", "mini-host", False),
+    "macos-arm64": ("RUNNER_MACOS_ARM", "denext-macos-arm64", "macos-latest", "mini-host", True),
     "macos-x64": ("RUNNER_MACOS_X64", "denext-macos-x64", "macos-15-intel", None, True),
     # Linux arm64 job containers on the Mac host (Docker Desktop; Ubuntu 22.04 image, so a job that needs
     # GitHub's 22.04 ARM image on overflow names it: `key=linux-arm64@ubuntu-22.04-arm`).
-    "linux-arm64": ("RUNNER_LINUX_ARM64", "denext-linux-arm64", "ubuntu-24.04-arm", None, False),
+    "linux-arm64": ("RUNNER_LINUX_ARM64", "denext-linux-arm64", "ubuntu-24.04-arm", "mini-host", False),
     # The Pi (GNOME session on arm64): no GitHub equivalent; pinned jobs only.
     "linux-arm64-desktop": ("RUNNER_LINUX_ARM64_DESKTOP", "denext-linux-arm64-desktop", "ubuntu-24.04-arm", None, False),
 }
@@ -128,7 +128,26 @@ POOL_MEM_GB = {
 
 # A shared group's capacity variable (the Linux host's three labels are one 8-core
 # host's job containers).
-GROUP_SLOTS_VAR = {"linux-host": "RUNNER_LINUX_X64_SHARED_SLOTS"}
+GROUP_SLOTS_VAR = {"linux-host": "RUNNER_LINUX_X64_SHARED_SLOTS", "mini-host": "RUNNER_MINI_MEM_GB"}
+
+# A group measured in memory, not slots. The Mac host's three pools (macOS VMs, Windows arm64 VMs,
+# Linux arm64 job containers) each have their own slots but share one RAM budget (the fleet's
+# RAM_BUDGET_GB, 16): a job takes its pool's GB of it. Two macOS VMs fill it, and a Linux arm64 job
+# then waits for one of them to end however free its own slot looks (Brainwires/deno, 2026-11-18/19:
+# `ubuntu-22.04-arm / build debug` waited 10, 27 and 36 min on a "free" slot with GitHub's arm64
+# image idle). name -> GB per job; the capacity is the group's variable, else GROUP_MEM_GB.
+GROUP_WEIGHT = {"mini-host": {"macos-arm64": 8, "windows-arm64": 8, "linux-arm64": 6}}
+GROUP_MEM_GB = {"mini-host": 16}
+
+
+def group_weight(pool_name):
+    """What one job of the pool takes of its group: its GB in a memory group, else 1 slot."""
+    return GROUP_WEIGHT.get(POOLS[pool_name][3], {}).get(pool_name, 1)
+
+
+def _stale_group_free(group):
+    """A group's room while the health is stale: one job (its largest job in a memory group)."""
+    return max(GROUP_WEIGHT.get(group, {}).values(), default=STALE_FREE)
 
 HEALTH_MAX_AGE = 10 * 60  # seconds: an older DENEXT_POOL_HEALTH is stale
 # GitHub fixes a run's `vars` (so DENEXT_POOL_HEALTH) when the run (attempt) starts, not when a job
@@ -453,21 +472,39 @@ def free_slots(pools_in_use, health_pools, variables, counts, stalled):
             held = counts.running.get(p.label, 0) + counts.queued.get(p.label, 0)
             free[p.label] = max(0, STALE_FREE - held) if p.label not in stalled else 0
             if p.group:
-                g = groups.get(p.group, STALE_FREE)
-                groups[p.group] = max(0, g - held)
+                g = groups.get(p.group, _stale_group_free(p.group))
+                groups[p.group] = max(0, g - held * group_weight(p.name))
         return free, groups
     for p in pools_in_use:
         free[p.label] = pool_free(p.label, health_pools, counts, stalled)
-    group_labels = {}
+    group_labels, weight = {}, {}
     for name, (_, label, _, group, _) in POOLS.items():
         if group:
             group_labels.setdefault(group, []).append(label)
+            weight[label] = group_weight(name)
     for group in {p.group for p in pools_in_use if p.group}:
         labels = group_labels[group]
         try:
             cap = int(variables.get(GROUP_SLOTS_VAR.get(group, ""), "") or "x")
         except ValueError:
             cap = None
+        if group in GROUP_WEIGHT:
+            # A memory group: its GB, minus what the labels that can run a job hold or are
+            # promised (a pool that is not ok or paused runs none: its queue takes no memory).
+            if cap is None:
+                cap = GROUP_MEM_GB[group]
+            busy = want = 0
+            for l in labels:
+                e = health_pools.get(l)
+                if not isinstance(e, dict) or e.get("ok") is not True or e.get("paused") is True:
+                    continue
+                busy += (_n(e.get("busy")) or 0) * weight[l]
+                running = counts.running.get(l, 0)
+                if counts.busy_runners is not None:
+                    running = max(running, counts.busy_runners.get(l, 0))
+                want += (running + max(_n(e.get("queued")) or 0, counts.queued.get(l, 0))) * weight[l]
+            groups[group] = max(0, cap - max(busy, want))
+            continue
         if cap is None:
             caps = []
             for l in labels:
@@ -516,7 +553,7 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             if other.parent_label == p.label and other.label in free:
                 free[other.label] = min(free[other.label], free[p.label])
         if p.group:
-            groups[p.group] = groups.get(p.group, 0) - 1
+            groups[p.group] = groups.get(p.group, 0) - group_weight(p.name)
 
     for job in jobs:
         if job["follow"] or not job["pinned"]:
@@ -552,7 +589,7 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             if p.macos:
                 hosted_macos += 1
             plan[key], rows[key] = image, (p.name, "GitHub", f"needs {job['mem']} GB, {p.label} holds {mem_of(p)}")
-        elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) > 0) and (
+        elif free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) >= group_weight(p.name)) and (
             p.parent_label not in free or free[p.parent_label] > 0
         ):
             take(p)
