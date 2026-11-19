@@ -835,6 +835,77 @@ class SaturationTest(unittest.TestCase):
         h = json.dumps({"v": 1, "checked_at": NOW - 60, "pools": {}, "github_off": ["macos", "nope", 3]})
         self.assertEqual(pr.github_off(h, NOW), {"macos"})
 
+    # ---- the fleet's routing rules (the health's `routing`): which classes may use GitHub at all
+    ROUTING = {"v": 1, "classes": [
+        {"labels": ["denext-windows-x64-fast"], "github": True, "order": ["win-x64-brain", "win-x64"]},
+        {"labels": ["denext-windows-x64"], "repo": "Brainwires/deno", "workflow": "ci.yml", "github": False,
+         "order": ["win-x64-brain", "win-x64"]},
+        {"labels": ["denext-windows-x64"], "github": True, "order": ["win-x64-brain", "win-x64"]},
+        {"labels": ["denext-macos-arm64"], "github": False, "order": ["mac-arm"]},
+    ]}
+
+    def routed(self, pools, age=60, routing=None):
+        return json.dumps({"v": 1, "checked_at": NOW - age, "pools": pools, "github": {},
+                           "routing": self.ROUTING if routing is None else routing})
+
+    def test_routing_a_class_without_github_never_leaves_our_pools(self):
+        h = self.routed({"denext-macos-arm64": entry(2, busy=2)})
+        plan, rows, _, _ = run(env("a=macos-arm64@macos-15 b=macos-arm64@macos-15 c=macos-arm64@macos-15"
+                                   " d=macos-arm64@macos-15 e=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual([plan[k] for k in "abcde"], [ours(MAC)] * 5)
+        self.assertTrue(all(r[2] == "ours (routing)" and "GitHub is not allowed for denext-macos-arm64" in r[3]
+                            and "mac-arm" in r[3] for r in rows))
+        self.assertEqual(pr.LAST["tripwire"], [])
+
+    def test_routing_holds_even_on_an_unhealthy_pool_and_says_so(self):
+        h = self.routed({"denext-macos-arm64": dict(entry(1), ok=False, reason="NOT CLEAN")})
+        plan, rows, _, _ = run(env("a=macos-arm64", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan["a"], ours(MAC))
+        self.assertIn("GitHub is not allowed", rows[0][3])
+
+    def test_routing_a_class_with_github_overflows_as_before(self):
+        h = self.routed({"denext-windows-x64": entry(1, busy=1)})
+        plan, rows, _, _ = run(env("a=windows-x64@windows-2022 b=windows-x64@windows-2022", h, RUNNER_WINDOWS_X64=WIN))
+        self.assertEqual([plan[k] for k in "ab"], ["windows-2022"] * 2)
+        self.assertEqual(pr.routing_no_github(h, NOW, "Brainwires/denext", ".github/workflows/ci.yml"),
+                         {"denext-macos-arm64": "mac-arm"})
+
+    def test_routing_the_first_class_that_fits_the_repository_and_workflow_decides(self):
+        h = self.routed({})
+        held = pr.routing_no_github(h, NOW, "Brainwires/deno", ".github/workflows/ci.yml")
+        self.assertEqual(held, {"denext-windows-x64": "win-x64-brain > win-x64", "denext-macos-arm64": "mac-arm"})
+        # another workflow of that repository, or another repository: the later class (GitHub allowed)
+        self.assertNotIn("denext-windows-x64", pr.routing_no_github(h, NOW, "Brainwires/deno", ".github/workflows/x.yml"))
+        self.assertNotIn("denext-windows-x64", pr.routing_no_github(h, NOW, "Brainwires/denext", ".github/workflows/ci.yml"))
+        # globs
+        g = self.routed({}, routing={"v": 1, "classes": [
+            {"labels": ["denext-linux-x64"], "repo": "Brainwires/*", "workflow": "ci*.yml", "github": False, "order": []}]})
+        self.assertIn("denext-linux-x64", pr.routing_no_github(g, NOW, "brainwires/Deno", ".github/workflows/ci.generate.yml"))
+        self.assertEqual(pr.routing_no_github(g, NOW, "other/repo", ".github/workflows/ci.yml"), {})
+        self.assertEqual(pr.workflow_path({"GITHUB_WORKFLOW_REF": "Brainwires/deno/.github/workflows/ci.yml@refs/heads/x"}),
+                         ".github/workflows/ci.yml")
+        self.assertEqual(pr.workflow_path({}), "")
+
+    def test_routing_holds_in_a_frozen_value_and_expires(self):
+        self.assertIn("denext-macos-arm64", pr.routing_no_github(self.routed({}, age=17 * 60), NOW, "a/b", ""))
+        self.assertEqual(pr.routing_no_github(self.routed({}, age=pr.GITHUB_OFF_MAX_AGE + 1), NOW, "a/b", ""), {})
+
+    def test_routing_missing_or_malformed_changes_nothing(self):
+        for routing in ({"v": 2, "classes": self.ROUTING["classes"]}, {"v": 1, "classes": "x"}, "nope", {"v": 1},
+                        {"v": 1, "classes": [3, {"labels": "x", "github": False}, {"labels": ["denext-macos-arm64"], "github": "no"},
+                                             {"github": False, "order": []}]}):
+            self.assertEqual(pr.routing_no_github(self.routed({}, routing=routing), NOW, "a/b", ""), {}, routing)
+        h = json.dumps({"v": 1, "checked_at": NOW - 60, "pools": {"denext-macos-arm64": entry(1, busy=1)}, "github": {}})
+        self.assertEqual(pr.routing_no_github(h, NOW, "a/b", ""), {})
+        plan, _, _, _ = run(env("a=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
+        self.assertEqual(plan["a"], "macos-15")
+
+    def test_routing_does_not_send_a_forks_pull_request_to_our_runners(self):
+        e = env("a=macos-arm64@macos-15", self.routed({"denext-macos-arm64": entry(2)}), RUNNER_MACOS_ARM=MAC)
+        e.update(GITHUB_EVENT_NAME="pull_request_target")
+        plan, rows, _, _ = run(e)
+        self.assertEqual(plan["a"], "macos-15")
+
     def test_below_the_threshold_is_not_saturated(self):
         h = health_gh({"denext-macos-arm64": entry(1, busy=1)}, {"macos": {"queued": 3, "oldest_at": NOW - 179}})
         plan, _, _, _ = run(env("a=macos-arm64@macos-15", h, RUNNER_MACOS_ARM=MAC))
