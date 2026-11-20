@@ -13,6 +13,15 @@ health the old rule holds (a free slot, else GitHub). A job that lands on GitHub
 although its healthy pool's wait was within the threshold is a TRIPWIRE: an
 error annotation, the `tripwire` output and a line in the step summary.
 
+The SPILL BOUND (`spill_estimate`) caps how long a job may wait for our pools:
+with a fresh value whose routing class for the job may use GitHub, the job's
+start estimate on the class's pools, host by host (busy slots' live ETAs, the
+jobs ahead, hosts that cannot start a job now: an `onlyWhenIdle` hold, paused,
+disabled, down), past the class's `spillAfterMinutes` (default 20) sends it to
+GitHub at pick time: a queued job can be moved later only by cancelling its
+whole run, which a default branch never allows. An unknown estimate, or an
+aged or stale value, keeps ours.
+
 The org's workflows run this through the composite action next to it
 (Brainwires/.github/actions/pick-runners). One picker job per workflow run
 decides for the run's jobs, prints a `plan` ({job key: runs-on}), and every job
@@ -54,6 +63,10 @@ Inputs (environment; the action maps its inputs onto these):
   label, eta = when the slot is expected to free) and `job_s` (the label's
   median job duration in seconds); see `live_wait`. Without them, or with an
   aged or stale value, the wait comes from the table (POOL_JOB_MINUTES).
+  The spill bound reads, from a fresh value, the routing's classes (with an
+  optional `spillAfterMinutes` each) and optional `pools.<p>.onlyWhenIdle`,
+  and the per-pool `hosts` (label, ok, paused, slots, busy, and optionally the
+  scheduler's pool-state `state` / `code`); see `spill_context`.
   The top-level `pull_request_labels` (the runs-on labels whose pools the
   fleet scheduler hands a same-repo pull_request) decides where a same-repo
   pull request's jobs may go: a pool whose label it leaves out sends them to
@@ -82,7 +95,7 @@ image families (macos, windows, ubuntu) that were saturated: a job of theirs
 waits for our busy pool instead of joining GitHub's queue>`, `tripwire=<JSON list
 of {key, pool, label, wait, threshold, repo, run_id, attempt, numbers} for each job
 sent to GitHub while its healthy pool's expected wait was within the threshold (or
-by the picker-error fallback)>`. A decision table (each job's pool, expected wait,
+by the picker-error fallback; never a job the spill bound sent there)>`. A decision table (each job's pool, expected wait,
 threshold and verdict), one `pick-runners decision <JSON>` line per job, and an
 `::error title=pick-runners tripwire::` annotation per tripwire go to stderr (and
 the table to the step summary, through the action).
@@ -469,6 +482,203 @@ def routing_no_github(value, now, repo, workflow):
     return out
 
 
+DEFAULT_SPILL_AFTER = 20  # minutes: a class's spillAfterMinutes when the published class gives none
+HOST_NEVER_STATES = ("down", "paused")  # pool-state.json states of a host that starts no job (no end known)
+
+
+class SpillContext:
+    """What the spill bound reads from a FRESH health value: `rules` ({lower-case label: {"class",
+    "order", "after"}} for the labels whose first fitting routing class may use GitHub), `pool_rules`
+    ({pool: [pools it waits idle for]}, the routing's `pools.<p>.onlyWhenIdle`), `hosts` (the health's
+    per-pool `hosts`: label, ok, paused, slots, busy, and when published the scheduler's pool-state
+    `state` / `code`) and `pools` (the health's per-label `pools`, for the live ETAs and queues)."""
+
+    def __init__(self, rules, pool_rules, hosts, pools):
+        self.rules, self.pool_rules, self.hosts, self.pools = rules, pool_rules, hosts, pools
+
+
+def spill_context(value, now, repo, workflow):
+    """A SpillContext from DENEXT_POOL_HEALTH, or None when the value is not fresh (`_fresh`: an aged or
+    stale value never spills: its ETAs and states are as old as the run), has no `routing` of version 1,
+    or no `hosts` map. Classes are matched as in `routing_no_github` (the first class that fits a label,
+    this repository and workflow file decides); only a class with `github: true` gets a bound, its
+    `spillAfterMinutes` (a whole number 0-1440) or DEFAULT_SPILL_AFTER when absent or malformed."""
+    health = _fresh(value, now)
+    if not health:
+        return None
+    routing, hosts, pools = health.get("routing"), health.get("hosts"), health.get("pools")
+    if (not isinstance(routing, dict) or routing.get("v") != 1 or not isinstance(routing.get("classes"), list)
+            or not isinstance(hosts, dict) or not isinstance(pools, dict)):
+        return None
+    path = workflow or ""
+    rules, seen = {}, set()
+    for c in routing["classes"]:
+        if not isinstance(c, dict) or not isinstance(c.get("github"), bool):
+            continue
+        r, w, labels = c.get("repo"), c.get("workflow"), c.get("labels")
+        if isinstance(r, str) and not _glob(r, repo or ""):
+            continue
+        if isinstance(w, str) and not (_glob(w, path) or _glob(w, path.rsplit("/", 1)[-1])):
+            continue
+        if not isinstance(labels, list):
+            continue
+        order = [o for o in (c.get("order") if isinstance(c.get("order"), list) else []) if isinstance(o, str)][:8]
+        after = c.get("spillAfterMinutes")
+        if isinstance(after, bool) or not isinstance(after, (int, float)) or not 0 <= after <= 1440:
+            after = DEFAULT_SPILL_AFTER
+        for label in labels:
+            if not isinstance(label, str) or label.lower() in seen:
+                continue
+            seen.add(label.lower())
+            if c["github"] and order:
+                rules[label.lower()] = {"class": c.get("id") if isinstance(c.get("id"), str) else None,
+                                        "order": order, "after": after}
+    pool_rules = {}
+    raw = routing.get("pools")
+    if isinstance(raw, dict):
+        for p, rule in raw.items():
+            idle = rule.get("onlyWhenIdle") if isinstance(rule, dict) else None
+            if isinstance(p, str) and isinstance(idle, list):
+                pool_rules[p] = [q for q in idle if isinstance(q, str)][:8]
+    return SpillContext(rules, pool_rules, hosts, pools)
+
+
+def _live_of(entry):
+    """(ETAs ascending, job_s or None) of a health pool entry's `live` / `job_s`, or None without a
+    well-formed `live` (see `live_entries`)."""
+    got = live_entries({"x": entry}).get("x") if isinstance(entry, dict) else None
+    return None if got is None else (got[1], got[2])
+
+
+def _drain(times, n, per_job):
+    """`times` (slot free times, seconds) after `n` more jobs of `per_job` seconds each took the earliest."""
+    times = list(times)
+    for _ in range(n):
+        t = min(times)
+        times.remove(t)
+        times.append(t + per_job)
+    return times
+
+
+def hold_release(pool, ctx, now):
+    """(seconds until `pool` may start a job as far as its `onlyWhenIdle` rule goes, why) — 0 when it has
+    no rule or every pool the rule names is idle — or (None, why) when that cannot be known.
+
+    The rule (routing schema, `pools.<p>.onlyWhenIdle`): the pool takes no new job while one of the named
+    pools has a job queued or running (a paused or disabled pool's queue does not count). A named pool is
+    idle once its busy slots end (their live ETAs, at least OVERRUN_FLOOR) and its queue has drained
+    through its slots (`job_s` each). Without those numbers (no live ETAs for a busy slot, a queue but no
+    `job_s`, a down pool with a queue, a named pool the health does not list): unknown."""
+    worst, why = 0.0, []
+    for q in ctx.pool_rules.get(pool, []):
+        hq = ctx.hosts.get(q)
+        if not isinstance(hq, dict):
+            return None, f"{pool} waits for {q} to be idle, which the health does not list"
+        busy, slots = _n(hq.get("busy")), _n(hq.get("slots"))
+        entry = ctx.pools.get(hq.get("label")) if isinstance(hq.get("label"), str) else None
+        if busy is None:
+            return None, f"{pool} waits for {q} to be idle, whose busy slots are not published"
+        queued = 0 if hq.get("paused") is True else (_n((entry or {}).get("queued")) or 0)
+        if busy == 0 and queued == 0:
+            continue
+        if queued and hq.get("ok") is not True:
+            return None, f"{pool} waits for {q} to be idle, which is down with {queued} job(s) queued"
+        live = _live_of(entry)
+        if live is None or len(live[0]) < busy:
+            return None, f"{pool} waits for {q} to be idle, whose busy slots have no ETA"
+        etas, job_s = live
+        if queued and not job_s:
+            return None, f"{pool} waits for {q} to be idle, whose {queued} queued job(s) have no duration"
+        times = [max(eta - now, OVERRUN_FLOOR) for eta in etas[:busy]] + [0.0] * max(0, (slots or busy) - busy)
+        times = _drain(times or [0.0], queued, job_s or 0)
+        worst = max(worst, max(times))
+        why.append(f"{q} busy {busy}, queued {queued}")
+    if not why:
+        return 0.0, ""
+    return worst, f"{pool} held until {', '.join(ctx.pool_rules[pool])} idle (onlyWhenIdle; {'; '.join(why)}): ~{_fmt_min(round(worst / 60, 1))} min"
+
+
+def spill_estimate(label, taken, ctx, now):
+    """The spill bound's input for one more job on `label`, whose slots are `taken` (busy, running, queued
+    and this run's earlier placements, as in `label_load`): a dict {class, after (minutes), estimate
+    (minutes until the job can start on one of the class's pools, or None: unknown), over (the estimate
+    exceeds `after`: the job goes to GitHub), held ([pools that cannot start it now]), why}, or None when
+    no published class with GitHub applies to the label (nothing spills).
+
+    Unlike the expected wait (`live_wait`, which counts the label's merged slots), this goes host by
+    host over the class's `order`: a host that is not ok, paused, or `down` / `paused` in the scheduler's
+    pool-state never starts it; a host held by an `onlyWhenIdle` rule starts it once the rule releases
+    (`hold_release`); a host the scheduler marks `blocked` by any other gate, and every number the
+    estimate needs but cannot read (the label's live ETAs, a busy slot without an ETA, a job duration
+    for the jobs ahead, a host the health does not list), make the estimate unknown: the job stays on
+    our pool (fail toward our runners, never toward unbounded GitHub). The label's ETAs go to the
+    available hosts' busy slots earliest first (the optimistic split: a spill needs a clear case), each
+    slot frees at the later of its ETA and its host's release, and the jobs ahead take the earliest free
+    slot for `job_s` each."""
+    rule = ctx.rules.get(label.lower()) if ctx else None
+    if not rule:
+        return None
+    out = {"class": rule["class"], "after": rule["after"], "estimate": None, "over": False, "held": [], "why": ""}
+
+    def unknown(why):
+        out["why"] = f"start estimate unknown ({why}): ours"
+        return out
+
+    if rule["after"] <= 0:
+        out["why"] = "spillAfterMinutes is 0: never spills"
+        return out
+    entry = ctx.pools.get(label) or next((e for l, e in ctx.pools.items() if l.lower() == label.lower()), None)
+    live = _live_of(entry)
+    if live is None:
+        return unknown(f"no live ETAs for {label}")
+    etas, job_s = live
+    hosts = []  # (release seconds, pool, slots, busy)
+    for p in rule["order"]:
+        h = ctx.hosts.get(p)
+        if not isinstance(h, dict):
+            return unknown(f"the health does not list {p}")
+        state, code = h.get("state"), h.get("code")
+        if h.get("ok") is not True or h.get("paused") is True or state in HOST_NEVER_STATES:
+            out["held"].append(p)
+            continue
+        if state == "blocked" and not (code == "intel-first" and p in ctx.pool_rules):
+            return unknown(f"{p} is held by a gate ({code or 'blocked'}) with no known end")
+        release, why = hold_release(p, ctx, now)
+        if release is None:
+            return unknown(why)
+        slots, busy = _n(h.get("slots")), _n(h.get("busy"))
+        if slots is None or busy is None:
+            return unknown(f"{p}'s slots are not published")
+        if release > 0:
+            out["held"].append(p)
+            out.setdefault("holds", []).append(why)
+        hosts.append((release, p, slots, busy))
+    times, pending = [], list(etas)
+    for release, _, slots, busy in sorted(hosts):
+        for _ in range(min(busy, slots)):
+            if not pending:
+                return unknown(f"a busy slot of {label} has no ETA")
+            times.append(max(release, max(pending.pop(0) - now, OVERRUN_FLOOR)))
+        times += [release] * max(0, slots - busy)
+    label_busy = max(_n((entry or {}).get("busy")) or 0, len(etas))
+    ahead = max(0, taken - label_busy)
+    if not times:
+        estimate = float("inf")
+    else:
+        if ahead and not job_s:
+            return unknown(f"{ahead} job(s) ahead on {label} and no job duration")
+        estimate = min(_drain(times, ahead, job_s or 0)) / 60
+    out["estimate"] = estimate if estimate == float("inf") else round(estimate, 1)
+    out["over"] = estimate > rule["after"]
+    pools_txt = " > ".join(rule["order"])
+    held = "; ".join(out.get("holds", []) + [f"{p} cannot start jobs" for p in out["held"] if not any(
+        h.startswith(p + " ") for h in out.get("holds", []))])
+    out["why"] = (f"start estimate {_fmt_min(out['estimate'])} min on {pools_txt}"
+                  + (f" ({held})" if held else "") + (f", {ahead} job(s) ahead" if ahead else "")
+                  + f", spill bound {_fmt_min(rule['after'])} min")
+    return out
+
+
 def pr_labels(value, now):
     """The runs-on labels (lower case) whose pools take a same-repo pull_request, from the health's
     `pull_request_labels` (published by the watchdog from the scheduler's policy: `widened_labels`,
@@ -778,7 +988,8 @@ def _fmt_min(m):
 
 
 def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None,
-             load=None, max_wait=None, records=None, live=None, now=None, no_github=None, pr_refused=None):
+             load=None, max_wait=None, records=None, live=None, now=None, no_github=None, pr_refused=None,
+             spill=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their slots whatever is
     free), then the rest in priority order:
 
@@ -800,14 +1011,20 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
     - past the threshold (or with no free slot), a job of a family ops turned off (`off`) waits
       for our pool anyway; a macOS job past the macOS cap, or a job whose image family is
       saturated on GitHub (`saturated`), waits too, but only for a pool that is merely busy (no
-      `notes` entry), at most WAIT_DEPTH per pool.
+      `notes` entry), at most WAIT_DEPTH per pool;
+    - the SPILL BOUND (`spill`, a SpillContext of a fresh value; `spill_estimate`): a job whose start
+      estimate on its routing class's pools, host by host (busy slots' ETAs, the jobs ahead, hosts that
+      cannot start now: an `onlyWhenIdle` hold, paused, disabled, down), exceeds the class's
+      `spillAfterMinutes` is past its threshold too, whatever the expected wait says (a slot held by a
+      rule looks free to it): GitHub, with the same exceptions as above (github_off, the macOS cap,
+      saturation). An unknown estimate never spills.
 
     `mem` is {pool name: GB} (`mem_capacity`; POOL_MEM_GB for a pool it leaves out). Followers copy
     their target. Each row's `why` names the pool, the expected wait and the threshold. `records`, a
     dict when given, gets {key: {pool, label, wait (minutes, None when not measured), source ("live":
     the fleet's per-slot ETAs, "table": POOL_JOB_MINUTES; None when not measured), threshold, eligible
-    (our pool in use, healthy, the job fits: GitHub only past the threshold)}} for every unpinned job
-    (the tripwire's input; see `tripwires`).
+    (our pool in use, healthy, the job fits: GitHub only past the threshold), spill (`spill_estimate`'s
+    dict, or None: no class bound)}} for every unpinned job (the tripwire's input; see `tripwires`).
 
     `live` ({label: (busy, etas, job_s)}, `live_entries` of a FRESH health value) and `now` (epoch)
     measure a label's (and a parent label's) wait from the live ETAs (`live_wait`); a label it leaves
@@ -935,7 +1152,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             continue
         if records is not None:
             records[key] = {"pool": p.name, "label": p.label, "wait": None, "source": None, "threshold": limit,
-                            "eligible": load is not None and not notes.get(p.label)}
+                            "eligible": load is not None and not notes.get(p.label), "spill": None}
+        sp = None
         if load is not None:
             if notes.get(p.label):
                 wait, binding, source, per = float("inf"), notes[p.label], None, POOL_JOB_MINUTES[p.name]
@@ -944,11 +1162,19 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             if records is not None and wait != float("inf"):
                 records[key]["wait"] = round(wait, 1)
                 records[key]["source"] = source
-            room = wait == 0
-            within = wait <= limit
             how = f"{source}, " if source else ""
             stat = (f"expected wait {_fmt_min(round(wait, 1))} min ({binding}; {how}~{_fmt_min(round(per, 1))} min/job),"
                     f" threshold {_fmt_min(limit)} min")
+            if spill is not None and now is not None and not notes.get(p.label):
+                sp = spill_estimate(p.label, label_load_.get(p.label, (0, 0))[1], spill, now)
+            if records is not None and sp is not None:
+                # JSON has no infinity: no pool of the class can start it at all is `estimate: null, over: true`
+                records[key]["spill"] = {k: (None if v == float("inf") else v) for k, v in sp.items() if k != "holds"}
+            spilled = sp is not None and sp["over"]
+            if sp is not None and (spilled or sp["held"] or (sp["estimate"] or 0) > 0 or sp["estimate"] is None):
+                stat += f"; {sp['why']}"
+            room = wait == 0 and not spilled
+            within = wait <= limit and not spilled
         else:
             room = free.get(p.label, 0) > 0 and (not p.group or groups.get(p.group, 0) >= group_weight(p.name)) and (
                 p.parent_label not in free or free[p.parent_label] > 0)
@@ -990,6 +1216,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
                 hosted_macos += 1
             if notes.get(p.label):
                 why = notes[p.label]
+            elif sp is not None and sp["over"]:
+                why = f"spill: {stat}: the start estimate exceeds the spill bound, GitHub"
             elif load is not None:
                 why = f"{stat}: exceeds it, GitHub"
             else:
@@ -1011,11 +1239,15 @@ def tripwires(plan, records):
     wait there was within the threshold: [{key, pool, label, wait, threshold}]. The decision rules
     never do that (a job within the threshold always takes our pool); this is the independent check
     that they still don't, so a placement like the 4.20.1 gate's (coverage shards on ubuntu-latest
-    beside an idle pool) is an error in the log, never silent."""
+    beside an idle pool) is an error in the log, never silent. A job the spill bound sent to GitHub (its
+    start estimate past the class's spillAfterMinutes, `spill.over`) is not one: the expected wait does
+    not see a slot a routing rule holds, so its wait may read 0 while the job could not start."""
     out = []
     for key, r in (records or {}).items():
         runs_on = plan.get(key)
         if not (isinstance(runs_on, str) and GITHUB_IMAGE.match(runs_on)):
+            continue
+        if (r.get("spill") or {}).get("over"):
             continue
         if r.get("eligible") and r.get("wait") is not None and r["wait"] <= r["threshold"]:
             out.append({"key": key, "pool": r["pool"], "label": r["label"], "wait": r["wait"],
@@ -1393,11 +1625,13 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         records = {}
         # The live per-slot ETAs count only in a FRESH value: an aged one's are as old as the run.
         live = live_entries(health) if health is not None and not aged else None
+        # The spill bound likewise: a fresh value only (spill_context checks the age itself).
+        spill = None if aged else spill_context(variables.get("DENEXT_POOL_HEALTH"), now, repo, workflow_path(env))
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
                               github_off(variables.get("DENEXT_POOL_HEALTH"), now),
                               None if load[0] is None else load, max_wait, records, live, now,
                               routing_no_github(variables.get("DENEXT_POOL_HEALTH"), now, repo, workflow_path(env)),
-                              pr_refused)
+                              pr_refused, spill)
         LAST["blocked"] = sorted({l for l, n in notes.items() if n} | set(refused_labels))
         for key, r in records.items():
             r["runs_on"] = plan[key]
@@ -1423,7 +1657,14 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         return plan, [(k, "?", "GitHub", "picker error", v) for k, v in plan.items()], {}
 
 
-def table(rows, free, saturated=None, tripwire=None):
+def spilled(decisions):
+    """[(key, spill dict)] of the jobs the spill bound sent to GitHub (see `allocate`)."""
+    return [(k, r["spill"]) for k, r in (decisions or {}).items()
+            if (r.get("spill") or {}).get("over") and isinstance(r.get("runs_on"), str)
+            and GITHUB_IMAGE.match(r["runs_on"])]
+
+
+def table(rows, free, saturated=None, tripwire=None, spills=None):
     lines = ["| job | pool | decision | why | runs-on |", "| --- | --- | --- | --- | --- |"]
     for key, pool, decision, why, runs_on in rows:
         lines.append(f"| {key} | {pool} | {decision} | {why} | `{_dumps(runs_on)}` |")
@@ -1434,6 +1675,11 @@ def table(rows, free, saturated=None, tripwire=None):
         lines.append("")
         lines.append("GitHub saturated: " + ", ".join(
             f"{f} (queued {s // 60} min)" for f, s in sorted(saturated.items())))
+    if spills:
+        lines.append("")
+        lines.append("Spilled to GitHub (start estimate past the class's spill bound): " + ", ".join(
+            f"{k} ({'no pool can start it' if s['estimate'] is None else _fmt_min(s['estimate']) + ' min'}"
+            f" > {_fmt_min(s['after'])})" for k, s in spills))
     if tripwire:
         lines.append("")
         lines.append("**TRIPWIRE: on GitHub although our pool was healthy within the threshold:** " + ", ".join(
@@ -1476,12 +1722,12 @@ def main(argv):
               f" (threshold {t['threshold']} min; slots {n.get('healthy_slots', '?')}, busy"
               f" {n.get('busy')}, queued {n.get('queued')})" + (f": {t['reason']}" if t.get("reason") else ""),
               file=sys.stderr)
-    print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free, LAST["saturated"], LAST["tripwire"]), file=sys.stderr)
+    print(("DRY RUN (no API call)\n" if dry else "") + table(rows, free, LAST["saturated"], LAST["tripwire"], spilled(LAST["decisions"])), file=sys.stderr)
     summary = env.get("GITHUB_STEP_SUMMARY")
     if summary and not dry:
         try:
             with open(summary, "a", encoding="utf-8") as f:
-                f.write("### Runner picks\n\n" + table(rows, free, LAST["saturated"], LAST["tripwire"]) + "\n")
+                f.write("### Runner picks\n\n" + table(rows, free, LAST["saturated"], LAST["tripwire"], spilled(LAST["decisions"])) + "\n")
         except OSError:
             pass
     return 0

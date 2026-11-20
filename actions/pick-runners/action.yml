@@ -2,7 +2,9 @@ name: Pick runners
 description: >-
   Our self-hosted pools first, GitHub-hosted only as the backup: each job of the run goes to our pool
   unless its expected wait there (slots, busy, queued and this run's own placements, from the fleet's
-  DENEXT_POOL_HEALTH) exceeds its family's threshold. See pick_runners.py for the rules.
+  DENEXT_POOL_HEALTH) exceeds its family's threshold, or its start estimate on its routing class's pools
+  (live ETAs, rule holds, paused / down hosts) exceeds the class's spillAfterMinutes (default 20).
+  See pick_runners.py for the rules.
 inputs:
   jobs:
     description: >-
@@ -56,6 +58,7 @@ outputs:
     description: >-
       Jobs sent to GitHub although our healthy pool's expected wait was within the threshold, as JSON (each with the
       run, the pool's slots / busy / queued and the wait); `[]` when the rule held. Each is also an error annotation.
+      A job the spill bound sent to GitHub is not one (its decision line carries `spill`).
     value: ${{ steps.pick.outputs.tripwire }}
 runs:
   using: composite

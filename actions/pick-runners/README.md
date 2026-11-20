@@ -69,6 +69,42 @@ An aged or stale value, or a label without `live` (an older publisher, or a malf
 table rule above, unchanged. The decision's `why` says which (`live, ~N min/job` or
 `table, ~N min/job`) and the `pick-runners decision` line carries `"source": "live" | "table"`.
 
+**Spill bound** (jobs never wait unboundedly on our pools). The expected wait counts a label's merged
+slots, so a slot a routing rule holds looks free (2026-11-20: two `denext-windows-x64` jobs waited 87 min
+while brain ran a long job and the VM sat idle under `onlyWhenIdle: ["mac-x64"]` behind an Intel Mac
+job). A queued job can then only be moved by cancelling its whole run, which a default / protected
+branch never allows, so the bound is applied at pick time: when the health is fresh and the job's
+routing class (the first published class that fits its label, repository and workflow) may use GitHub,
+the picker estimates when the job can START on the class's `order` pools, host by host, and a job whose
+estimate exceeds the class's `spillAfterMinutes` (default **20**; `0`: never) takes its GitHub image.
+
+- Hosts (the health's `hosts`): one that is not ok, paused (disabled included), or `down` / `paused` in
+  the scheduler's pool-state (`state`, optional) starts nothing. One under an `onlyWhenIdle` rule (the
+  routing's `pools.<p>.onlyWhenIdle`, optional) starts jobs once every pool it names is idle: their
+  busy slots' live ETAs (at least 1 min) and then their queue (a paused pool's does not count) drained
+  through their slots at `job_s` each. The scheduler's `blocked` / `intel-first` is that rule.
+- Slots: the label's live ETAs go to the available hosts' busy slots, earliest first (the optimistic
+  split); each slot frees at the later of its ETA and its host's release, a free slot at its host's
+  release. The jobs ahead (the label's queue and this run's own earlier placements) take the earliest
+  slot for `job_s` each; the estimate is the earliest time left.
+- Unknown keeps ours (fail toward our runners, never toward unbounded GitHub): an aged or stale value,
+  no `routing` or `hosts`, no class with GitHub for the label, no live ETAs, a busy slot without an ETA,
+  jobs ahead without `job_s`, a host the health does not list, a held pool's release that cannot be
+  computed, or a host `blocked` by any other gate (disk, RAM, …: no known end).
+- The other limits still apply past the bound: the `github_off` switch and GitHub saturation keep the
+  job on our pool (`ours (waits)`), so does the macOS cap; fork and refused-pull-request rules come
+  first. A spilled job takes no slot, so the next job is measured without it.
+- Logged: the row's `why` starts with `spill:` and names the estimate, the held hosts and the bound;
+  each decision line has `"spill": {class, after, estimate, over, held, why}` (`estimate: null` with
+  `over: true`: no pool of the class can start it at all; `spill: null`: no bound applied); the step
+  summary lists the spilled jobs. A spilled job is never a tripwire (its expected wait may read 0).
+
+The watchdog's own overflow by waiting (denext-internal ops/runners, `spillAfterMinutes`) still moves
+a job that has queued that long off a feature branch; this bound keeps it from queueing there at all.
+The fleet publishes `spillAfterMinutes`, `pools.<p>.onlyWhenIdle` and the hosts' `state` / `code` once
+its publisher carries them; until then every class with GitHub takes 20 and no host is seen as held
+by a rule (paused / down / unhealthy hosts already are).
+
 **Thresholds** (`max-wait`: any subset of `linux=10 windows=15 macos=20`, the defaults; `0` restores
 the old free-slot-or-GitHub rule). A family ops turned off (`github_off`) never goes to GitHub.
 
@@ -107,7 +143,8 @@ those three with a Docker daemon. An idle `-2204` label is therefore no free cap
   for each other. Across repositories the fleet's `queued` count (published every ~1-5 min) is
   the only signal.
 - Routing rules: the health's optional `routing` (`{"v": 1, "classes": [{"labels": [...], "repo"?,
-  "workflow"?, "github": true|false, "order": [our pools]}]}`, published by the fleet watchdog from the
+  "workflow"?, "github": true|false, "order": [our pools], "spillAfterMinutes"?}], "pools"?: {"<pool>":
+  {"onlyWhenIdle": [pools]}}}`, published by the fleet watchdog from the
   user's `routing.json`, which Fleet's Routing form edits) says which job classes may use GitHub at
   all. Classes are checked in order; the first one that fits a job's label (and this run's repository
   and workflow file, `*` globs) decides. `github: false` keeps every job of the label on our pool
