@@ -1564,5 +1564,237 @@ class TripwireTest(unittest.TestCase):
         self.assertNotIn("tripwire::", out.stderr)
 
 
+# ---- the spill bound: a job whose start estimate on its class's pools exceeds spillAfterMinutes ----
+
+SPILL_ROUTING = {"v": 1, "classes": [
+    {"id": "windows-x64", "labels": ["denext-windows-x64"], "github": True, "order": ["win-x64-brain", "win-x64"]},
+    {"id": "macos-x64", "labels": ["denext-macos-x64"], "github": True, "order": ["mac-x64"]},
+    {"id": "macos-arm64", "labels": ["denext-macos-arm64"], "github": True, "order": ["mac-arm"]},
+], "pools": {"win-x64": {"onlyWhenIdle": ["mac-x64"]}}}
+
+
+def host(label, slots=1, busy=0, ok=True, paused=False, **extra):
+    return dict({"label": label, "ok": ok, "slots": slots, "busy": busy, "paused": paused}, **extra)
+
+
+def spill_health(win_live, mac_live, mac_queued=0, win_job_s=1200, mac_job_s=1800, brain=None, win=None,
+                 routing=None, age=60, macx=None, extra_pools=None, extra_hosts=None):
+    """The Windows label (brain + the VM, 1 slot each) and the Intel Mac the VM yields to. `win_live` /
+    `mac_live`: [[start, eta], ...] of the labels' busy slots (None: no `live`)."""
+    win_busy = len(win_live or [])
+    pools = {"denext-windows-x64": live_entry(2, busy=win_busy, live=win_live, job_s=win_job_s),
+             "denext-macos-x64": live_entry(1, busy=len(mac_live or []), live=mac_live, job_s=mac_job_s,
+                                            queued=mac_queued)}
+    pools.update(extra_pools or {})
+    hosts = {"win-x64-brain": brain or host("denext-windows-x64", busy=min(win_busy, 1)),
+             "win-x64": win or host("denext-windows-x64", busy=max(0, win_busy - 1)),
+             "mac-x64": macx or host("denext-macos-x64", busy=len(mac_live or []))}
+    hosts.update(extra_hosts or {})
+    return json.dumps({"v": 1, "checked_at": NOW - age, "pools": pools, "hosts": hosts,
+                       "routing": SPILL_ROUTING if routing is None else routing})
+
+
+class SpillTest(unittest.TestCase):
+    """Jobs never wait unboundedly on our pools: past the class's spillAfterMinutes, GitHub at pick time."""
+
+    def pick(self, h, jobs="a=windows-x64", max_wait=None, **kw):
+        variables = {"RUNNER_WINDOWS_X64": WIN, "RUNNER_MACOS_X64": MACX, "RUNNER_MACOS_ARM": MAC}
+        variables.update(kw)
+        return records_of(env(jobs, h, max_wait=max_wait, **variables))
+
+    def test_the_87_minute_wait_spills(self):
+        # 2026-11-20: brain busy with a long job (ETA 70 min), the VM free but held by onlyWhenIdle while
+        # the Intel Mac runs a job (ETA 45 min). The merged label shows a free slot: expected wait 0.
+        h = spill_health([[NOW - 600, NOW + 70 * 60]], [[NOW - 600, NOW + 45 * 60]])
+        plan, rows, decisions, trip = self.pick(h, "a=windows-x64 b=windows-x64")
+        self.assertEqual(plan, {"a": "windows-latest", "b": "windows-latest"})
+        self.assertEqual(decisions["a"]["wait"], 0)  # what the expected wait alone saw
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 45)
+        self.assertTrue(decisions["a"]["spill"]["over"])
+        self.assertEqual(decisions["a"]["spill"]["held"], ["win-x64"])
+        self.assertEqual(decisions["a"]["spill"]["class"], "windows-x64")
+        self.assertTrue(rows[0][3].startswith("spill: "), rows[0][3])
+        self.assertIn("start estimate 45 min on win-x64-brain > win-x64", rows[0][3])
+        self.assertIn("win-x64 held until mac-x64 idle (onlyWhenIdle", rows[0][3])
+        self.assertIn("spill bound 20 min", rows[0][3])
+        self.assertEqual(decisions["b"]["spill"]["estimate"], 45)  # `a` went to GitHub: it took no slot
+        self.assertEqual(trip, [])  # a spill is not a tripwire, although the expected wait read 0
+
+    def test_the_mac_idle_releases_the_hold(self):
+        h = spill_health([[NOW - 600, NOW + 70 * 60]], [])
+        plan, rows, decisions, _ = self.pick(h)
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 0)
+        self.assertFalse(decisions["a"]["spill"]["over"])
+        self.assertEqual(rows[0][2], "ours")
+
+    def test_a_hold_that_ends_soon_keeps_ours(self):
+        h = spill_health([[NOW - 600, NOW + 70 * 60]], [[NOW - 600, NOW + 5 * 60]])
+        plan, rows, decisions, _ = self.pick(h)
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 5)
+        self.assertIn("start estimate 5 min", rows[0][3])
+        self.assertIn("spill bound 20 min", rows[0][3])
+
+    def test_the_held_pools_queue_drains_first(self):
+        # the Mac: 1 busy (10 min) and 1 queued (30 min): the VM is held 40 min; brain frees at 70
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 600]], mac_queued=1)
+        _, _, decisions, _ = self.pick(h)
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 40)
+        # a paused Mac's queue does not count: only its running job holds the VM
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 600]], mac_queued=1,
+                         macx=host("denext-macos-x64", busy=1, paused=True))
+        _, _, decisions, _ = self.pick(h)
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 10)
+
+    def test_the_class_bound_is_read_and_defaults_to_20(self):
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]])
+        routing = json.loads(json.dumps(SPILL_ROUTING))
+        routing["classes"][0]["spillAfterMinutes"] = 60
+        plan, _, decisions, _ = self.pick(spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]], routing=routing))
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertEqual(decisions["a"]["spill"]["after"], 60)
+        for bad in (True, -1, 2000, "20"):
+            routing["classes"][0]["spillAfterMinutes"] = bad
+            _, _, decisions, _ = self.pick(spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]], routing=routing))
+            self.assertEqual(decisions["a"]["spill"]["after"], 20, bad)
+        routing["classes"][0]["spillAfterMinutes"] = 0  # never
+        plan, rows, decisions, _ = self.pick(spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]], routing=routing))
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertFalse(decisions["a"]["spill"]["over"])
+        self.assertIn("spillAfterMinutes is 0", decisions["a"]["spill"]["why"])
+        self.assertEqual(pr.spill_context(h, NOW, "a/b", "").rules["denext-windows-x64"]["after"], 20)
+
+    def test_unknown_estimates_keep_ours(self):
+        long_brain, long_mac = [[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]]
+        cases = {
+            "no live ETAs for denext-windows-x64": spill_health(None, long_mac, brain=host("denext-windows-x64", busy=1)),
+            "whose busy slots have no ETA": spill_health(long_brain, None, macx=host("denext-macos-x64", busy=1)),
+            "whose 1 queued job(s) have no duration": spill_health(long_brain, long_mac, mac_queued=1, mac_job_s=None),
+            "the health does not list win-x64": json.dumps(dict(json.loads(spill_health(long_brain, long_mac)),
+                                                                hosts={"win-x64-brain": host("denext-windows-x64", busy=1),
+                                                                       "mac-x64": host("denext-macos-x64", busy=1)})),
+            "held by a gate (disk)": spill_health(long_brain, long_mac, win=host("denext-windows-x64", state="blocked",
+                                                                                code="disk")),
+        }
+        for why, h in cases.items():
+            plan, rows, decisions, _ = self.pick(h)
+            self.assertEqual(plan, {"a": ours(WIN)}, why)
+            self.assertIsNone(decisions["a"]["spill"]["estimate"], why)
+            self.assertIn(why, decisions["a"]["spill"]["why"])
+            self.assertIn("start estimate unknown", rows[0][3])
+
+    def test_the_schedulers_intel_first_state_is_the_rule(self):
+        # pool-state's blocked/intel-first is the onlyWhenIdle hold: estimated from the rule
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]],
+                         win=host("denext-windows-x64", state="blocked", code="intel-first"))
+        plan, _, decisions, _ = self.pick(h)
+        self.assertEqual(plan, {"a": "windows-latest"})
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 45)
+        # without the published rule the end is unknown: ours
+        routing = dict(SPILL_ROUTING, pools={})
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]], routing=routing,
+                         win=host("denext-windows-x64", state="blocked", code="intel-first"))
+        plan, _, decisions, _ = self.pick(h)
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertIsNone(decisions["a"]["spill"]["estimate"])
+
+    def test_paused_disabled_and_down_hosts_start_nothing(self):
+        for win in (host("denext-windows-x64", paused=True), host("denext-windows-x64", ok=False),
+                    host("denext-windows-x64", state="down", code="host-unreachable"),
+                    host("denext-windows-x64", state="paused", code="disabled")):
+            h = spill_health([[NOW, NOW + 30 * 60]], [], win=win)
+            plan, rows, decisions, trip = self.pick(h)
+            self.assertEqual(plan, {"a": "windows-latest"}, win)
+            self.assertEqual(decisions["a"]["spill"]["estimate"], 30)
+            self.assertEqual(decisions["a"]["spill"]["held"], ["win-x64"])
+            self.assertIn("win-x64 cannot start jobs", rows[0][3])
+            self.assertEqual(trip, [])
+        # every host of the class out: no pool can start it (JSON has no infinity: estimate null, over)
+        h = spill_health([], [], win=host("denext-windows-x64", paused=True),
+                         brain=host("denext-windows-x64", state="down"))
+        plan, _, decisions, _ = self.pick(h)
+        self.assertEqual(plan, {"a": "windows-latest"})
+        self.assertIsNone(decisions["a"]["spill"]["estimate"])
+        self.assertTrue(decisions["a"]["spill"]["over"])
+
+    def test_this_runs_own_jobs_queue_into_the_estimate(self):
+        # brain frees in 10 min, the VM is free, 20-min jobs; threshold out of the way (windows=60):
+        # a 0 (the VM), b 10 (brain), c 20 (the VM again), d 30: past 20, GitHub
+        h = spill_health([[NOW, NOW + 600]], [])
+        plan, _, decisions, _ = self.pick(h, "a=windows-x64 b=windows-x64 c=windows-x64 d=windows-x64",
+                                          max_wait="windows=60")
+        self.assertEqual([decisions[k]["spill"]["estimate"] for k in "abcd"], [0, 10, 20, 30])
+        self.assertEqual([plan[k] for k in "abcd"], [ours(WIN)] * 3 + ["windows-latest"])
+
+    def test_aged_and_stale_values_never_spill(self):
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]], age=20 * 60)
+        api = FakeApi(run={"run_started_at": iso(NOW - 15 * 60)})
+        plan, _, decisions, _ = records_of(env("a=windows-x64", h, max_wait=None, RUNNER_WINDOWS_X64=WIN), get=api)
+        self.assertIsNone(decisions["a"]["spill"])
+        self.assertEqual(plan, {"a": ours(WIN)})
+        self.assertIsNone(pr.spill_context(spill_health([], [], age=11 * 60), NOW, "a/b", ""))
+        self.assertIsNone(pr.spill_context(health({}), NOW, "a/b", ""))  # no routing, no hosts
+
+    def test_no_class_with_github_never_spills(self):
+        # a class without GitHub keeps its routing hold; a label no class fits has no bound
+        routing = {"v": 1, "classes": [{"labels": ["denext-windows-x64"], "github": False, "order": ["win-x64-brain"]}],
+                   "pools": SPILL_ROUTING["pools"]}
+        h = spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]], routing=routing)
+        plan, rows, decisions, _ = self.pick(h)
+        self.assertEqual((plan, rows[0][2]), ({"a": ours(WIN)}, "ours (routing)"))
+        routing = {"v": 1, "classes": [{"labels": ["denext-macos-x64"], "github": True, "order": ["mac-x64"]}]}
+        plan, _, decisions, _ = self.pick(spill_health([[NOW, NOW + 70 * 60]], [], routing=routing))
+        self.assertIsNone(decisions["a"]["spill"])
+        # a class for another repository does not apply
+        routing = dict(SPILL_ROUTING, classes=[dict(SPILL_ROUTING["classes"][0], repo="Brainwires/deno")])
+        self.assertEqual(pr.spill_context(spill_health([], [], routing=routing), NOW, "Brainwires/denext", "").rules, {})
+
+    def test_the_github_off_switch_and_saturation_still_hold(self):
+        base = json.loads(spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]]))
+        plan, rows, _, _ = self.pick(json.dumps(dict(base, github_off=["windows"])))
+        self.assertEqual((plan, rows[0][2]), ({"a": ours(WIN)}, "ours (waits)"))
+        self.assertIn("GitHub windows is off", rows[0][3])
+        sat = dict(base, github={"windows": {"queued": 4, "oldest_at": NOW - 600}})
+        plan, rows, _, _ = self.pick(json.dumps(sat))
+        self.assertEqual((plan, rows[0][2]), ({"a": ours(WIN)}, "ours (waits)"))
+        self.assertIn("saturated", rows[0][3])
+
+    def test_the_macos_cap_still_holds(self):
+        # the Intel Mac busy 45 min (one slot): its own class spills, but past the run's cap it waits
+        h = spill_health([], [[NOW, NOW + 45 * 60]])
+        e = env("m=macos-x64 n=macos-x64", h, max_wait="macos=60", RUNNER_MACOS_X64=MACX, RUNNER_WINDOWS_X64=WIN)
+        e["PICK_MACOS_CAP"] = "1"
+        plan, rows, decisions, _ = records_of(e)
+        self.assertEqual(plan["m"], "macos-15-intel")
+        self.assertTrue(decisions["m"]["spill"]["over"])
+        self.assertEqual((plan["n"], rows[1][2]), (ours(MACX), "ours (waits)"))
+        self.assertIn("cap 1", rows[1][3])
+
+    def test_the_cli_logs_the_spill(self):
+        e = dict(os.environ)
+        e.update(env("a=windows-x64", spill_health([[NOW, NOW + 70 * 60]], [[NOW, NOW + 45 * 60]]), max_wait=None,
+                     RUNNER_WINDOWS_X64=WIN))
+        e["PICK_DRY_RUN"] = "true"
+        # the script reads the clock: re-date the value to now
+        v = json.loads(json.loads(e["PICK_VARS"])["DENEXT_POOL_HEALTH"])
+        shift = int(__import__("time").time()) - NOW
+        v["checked_at"] += shift
+        for p in v["pools"].values():
+            p["live"] = [[s + shift, t + shift] for s, t in p.get("live", [])]
+        e["PICK_VARS"] = json.dumps({"RUNNER_WINDOWS_X64": WIN, "DENEXT_POOL_HEALTH": json.dumps(v)})
+        out = subprocess.run([sys.executable, "-I", pr.__file__], env=e, capture_output=True, text=True, check=True)
+        lines = dict(l.split("=", 1) for l in out.stdout.splitlines())
+        self.assertEqual(json.loads(lines["plan"]), {"a": "windows-latest"})
+        self.assertEqual(json.loads(lines["tripwire"]), [])
+        self.assertIn('"spill":{"class":"windows-x64","after":20,"estimate":45', out.stderr)
+        self.assertIn("Spilled to GitHub (start estimate past the class's spill bound): a (45 min > 20)", out.stderr)
+
+    def test_hold_release_unit(self):
+        ctx = pr.spill_context(spill_health([], [[NOW, NOW - 300]]), NOW, "a/b", "")
+        self.assertEqual(pr.hold_release("win-x64", ctx, NOW)[0], pr.OVERRUN_FLOOR)  # past its ETA: ends soon
+        self.assertEqual(pr.hold_release("win-x64-brain", ctx, NOW), (0.0, ""))  # no rule
+
+
 if __name__ == "__main__":
     unittest.main()
