@@ -54,6 +54,10 @@ Inputs (environment; the action maps its inputs onto these):
   label, eta = when the slot is expected to free) and `job_s` (the label's
   median job duration in seconds); see `live_wait`. Without them, or with an
   aged or stale value, the wait comes from the table (POOL_JOB_MINUTES).
+  The top-level `pull_request_labels` (the runs-on labels whose pools the
+  fleet scheduler hands a same-repo pull_request) decides where a same-repo
+  pull request's jobs may go: a pool whose label it leaves out sends them to
+  GitHub, and so does every pool while it is missing (see `pr_labels`).
 - PICK_MAX_WAIT (optional): the per-family thresholds in minutes, any subset of
   `linux=10 windows=15 macos=20` (DEFAULT_MAX_WAIT); 0 restores the free-slot-only rule.
   A family that is off (`github_off`) never goes to GitHub whatever the wait.
@@ -465,6 +469,30 @@ def routing_no_github(value, now, repo, workflow):
     return out
 
 
+def pr_labels(value, now):
+    """The runs-on labels (lower case) whose pools take a same-repo pull_request, from the health's
+    `pull_request_labels` (published by the watchdog from the scheduler's policy: `widened_labels`,
+    and `pull_request` among its `events`). The scheduler refuses a pull_request job on any other
+    pool, so it would queue there until GitHub drops it (2026-11-19: a same-repo pull request's job
+    sat 8 h on denext-windows-x64, "not in widened_labels: its sandbox hook predates same-repo pull
+    requests"). The policy changes rarely, so like `github_off` it holds in a value frozen at run
+    start up to GITHUB_OFF_MAX_AGE. None (unknown: every pool counts as refusing) when the value is
+    missing, too old, or has no well-formed list."""
+    try:
+        health = json.loads(value or "")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(health, dict):
+        return None
+    at = health.get("checked_at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or now - at > GITHUB_OFF_MAX_AGE:
+        return None
+    labels = health.get("pull_request_labels")
+    if not isinstance(labels, list) or not all(isinstance(l, str) for l in labels):
+        return None
+    return {l.lower() for l in labels}
+
+
 def workflow_path(env):
     """This run's workflow file (".github/workflows/ci.yml") from GITHUB_WORKFLOW_REF
     ("owner/repo/.github/workflows/ci.yml@refs/heads/x"), or ""."""
@@ -750,7 +778,7 @@ def _fmt_min(m):
 
 
 def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturated=None, mem=None, off=None,
-             load=None, max_wait=None, records=None, live=None, now=None, no_github=None):
+             load=None, max_wait=None, records=None, live=None, now=None, no_github=None, pr_refused=None):
     """({key: runs-on}, [decision rows]). Pinned jobs first (they take their slots whatever is
     free), then the rest in priority order:
 
@@ -763,6 +791,9 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
       pool (`notes`) waits forever: GitHub;
     - without the load (stale health), our pool only while it and its group have a free slot
       (`free` / `groups`), else the image (fail open toward speed, as before);
+    - a same-repo pull request's job whose pool does not take pull requests (`pr_refused`, {lower-case
+      label: why}; see `pr_labels`) takes its image, pinned or not, routing rules or not: the
+      scheduler would never start it on our pool;
     - a job whose label the routing rules keep off GitHub (`no_github`, {label: our pools in
       order}; `routing_no_github`) always takes our pool: no threshold, no depth limit, even when
       the pool is unhealthy or the job may not fit (the user said "not at all");
@@ -784,6 +815,7 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
     free = dict(free)
     groups = dict(groups)
     notes, saturated = notes or {}, saturated or {}
+    pr_refused = pr_refused or {}
     thresholds = dict(DEFAULT_MAX_WAIT, **(max_wait or {}))
     label_load_, group_load_ = ({}, {}) if load is None else ({k: list(v) for k, v in load[0].items()},
                                                              {k: list(v) for k, v in load[1].items()})
@@ -849,6 +881,10 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             plan[job["key"]] = job["image"] or p.image
             rows[job["key"]] = (p.name, "GitHub", "a fork's pull request never runs on our runners")
             continue
+        if p.label.lower() in pr_refused:
+            plan[job["key"]] = job["image"] or p.image
+            rows[job["key"]] = (p.name, "GitHub", pr_refused[p.label.lower()] + " (pinned: may not fit the image)")
+            continue
         take(p)
         plan[job["key"]] = p.pinned_runs_on
         why = "needs our hardware"
@@ -875,6 +911,10 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
         if p.mode == "image":
             # the job's own @image wins (a leg keeps the image its build ran on)
             plan[key], rows[key] = job["image"] or p.runs_on, (p.name, "GitHub", f"{POOLS[p.name][0]} names a GitHub image")
+            continue
+        if p.label.lower() in pr_refused:
+            # the scheduler refuses a pull_request job on this pool: it would never start there
+            plan[key], rows[key] = image, (p.name, "GitHub", pr_refused[p.label.lower()])
             continue
         if p.label.lower() in (no_github or {}):
             # the routing rules: this class never goes to GitHub, whatever the wait
@@ -983,15 +1023,17 @@ def tripwires(plan, records):
     return out
 
 
-def fallback_plan(jobs, pools, fork_pr):
-    """Every job on its image, the pinned ones on our pool (any error)."""
+def fallback_plan(jobs, pools, fork_pr, pr_refused=None):
+    """Every job on its image, the pinned ones on our pool (any error) unless that pool refuses
+    this run's pull request (`pr_refused`)."""
     plan = {}
     for job in jobs:
         if job["follow"]:
             continue
         p = pools[job["pool"]]
+        ours_ok = not fork_pr and p.label.lower() not in (pr_refused or {})
         plan[job["key"]] = (
-            p.pinned_runs_on if job["pinned"] and not fork_pr else (job["image"] or p.image)
+            p.pinned_runs_on if job["pinned"] and ours_ok else (job["image"] or p.image)
         )
     for job in jobs:
         if job["follow"]:
@@ -1196,6 +1238,24 @@ def is_fork_pr(env):
     return head != env.get("GITHUB_REPOSITORY")
 
 
+def same_repo_pr_refused(env, pools, value, now, fork_pr):
+    """{lower-case label: why} of the pools that must not get this run's jobs because it is a same-repo
+    pull_request and the fleet does not hand those pools one (`pr_labels`); {} for any other event (a
+    fork's pull request has its own rule)."""
+    if fork_pr or env.get("GITHUB_EVENT_NAME") != "pull_request":
+        return {}
+    accepted = pr_labels(value, now)
+    out = {}
+    for p in pools.values():
+        label = p.label.lower()
+        if accepted is None:
+            out[label] = ("a same-repo pull request: DENEXT_POOL_HEALTH does not say which pools take one"
+                          " (no pull_request_labels)")
+        elif label not in accepted:
+            out[label] = f"a same-repo pull request: {p.label} does not take pull requests (not in pull_request_labels)"
+    return out
+
+
 # Side output of the latest pick() (kept out of its return value): `decisions` {key: record} (see
 # `allocate`'s `records`, with the pool's numbers at pick time) and `tripwire` (`tripwires`, each with
 # the run and those numbers, plus any job the picker-error fallback sent to GitHub from a pool in use).
@@ -1244,6 +1304,12 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
     max_wait, bad_wait = max_wait_thresholds(env.get("PICK_MAX_WAIT"))
     for entry in bad_wait:
         warn(f"pick-runners: ignored the malformed PICK_MAX_WAIT entry {entry!r}")
+    pr_refused = same_repo_pr_refused(env, pools, variables.get("DENEXT_POOL_HEALTH"), now, fork_pr)
+    refused_labels = sorted({p.label for p in pools.values() if p.label.lower() in pr_refused})
+    if any(j["pool"] and pools[j["pool"]].label.lower() in pr_refused
+           and (j["pinned"] or pools[j["pool"]].mode == "ours") for j in jobs):
+        warn(f"pick-runners: {next(iter(pr_refused.values()))}: the jobs for {', '.join(refused_labels)}"
+             " take their GitHub image")
     in_use = [p for p in pools.values() if p.mode == "ours"]
     pinned_only = all(j["pinned"] or j["follow"] for j in jobs)
     health = fresh_health(variables.get("DENEXT_POOL_HEALTH"), now)
@@ -1255,7 +1321,8 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
             warn(f"pick-runners: {job['key']} needs {job['mem']} GB but is pinned to"
                  f" {pools[job['pool']].label}, which holds {mem[job['pool']]}: it may not fit")
     if fork_pr or not in_use or pinned_only:
-        plan, rows = allocate(jobs, pools, {}, {}, macos_cap, fork_pr, mem=mem)
+        plan, rows = allocate(jobs, pools, {}, {}, macos_cap, fork_pr, mem=mem, pr_refused=pr_refused)
+        LAST["blocked"] = refused_labels
         return plan, rows, {}
     try:
         repo, run_id = env.get("GITHUB_REPOSITORY", ""), env.get("GITHUB_RUN_ID", "")
@@ -1329,8 +1396,9 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         plan, rows = allocate(jobs, pools, free, groups, macos_cap, False, notes, saturated, mem,
                               github_off(variables.get("DENEXT_POOL_HEALTH"), now),
                               None if load[0] is None else load, max_wait, records, live, now,
-                              routing_no_github(variables.get("DENEXT_POOL_HEALTH"), now, repo, workflow_path(env)))
-        LAST["blocked"] = sorted(l for l, n in notes.items() if n)
+                              routing_no_github(variables.get("DENEXT_POOL_HEALTH"), now, repo, workflow_path(env)),
+                              pr_refused)
+        LAST["blocked"] = sorted({l for l, n in notes.items() if n} | set(refused_labels))
         for key, r in records.items():
             r["runs_on"] = plan[key]
             r["numbers"] = pool_numbers(r["label"], health, counts)
@@ -1340,7 +1408,7 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
         return plan, rows, free
     except Exception as e:  # never fail the run
         warn(f"pick-runners: {e}; every job but the pinned ones takes its GitHub image")
-        plan = fallback_plan(jobs, pools, False)
+        plan = fallback_plan(jobs, pools, False, pr_refused)
         # Loud, not silent: each job this sends to GitHub from a pool in use is a tripwire (the wait
         # was never measured, so the pool may well have been idle).
         LAST["tripwire"] = [
@@ -1349,6 +1417,7 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
                  reason=f"picker error: {e}"[:200], numbers=pool_numbers(pools[j["pool"]].label, health, None))
             for j in jobs
             if not j["follow"] and not j["pinned"] and pools[j["pool"]].mode == "ours"
+            and pools[j["pool"]].label.lower() not in pr_refused
             and isinstance(plan.get(j["key"]), str) and GITHUB_IMAGE.match(plan[j["key"]])
         ]
         return plan, [(k, "?", "GitHub", "picker error", v) for k, v in plan.items()], {}
