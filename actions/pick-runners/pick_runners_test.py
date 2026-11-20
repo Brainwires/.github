@@ -731,7 +731,7 @@ class ForkTest(unittest.TestCase):
         self.assertEqual(api.calls, [])
 
     def test_same_repo_pr_may(self):
-        h = health({"denext-windows-x64": entry(2)})
+        h = health_pr({"denext-windows-x64": entry(2)}, ["denext-windows-x64"])
         e = env("a=windows-x64", h, RUNNER_WINDOWS_X64=WIN)
         e.update(GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=self._event("Brainwires/denext"))
         plan, _, _, _ = run(e)
@@ -741,6 +741,99 @@ class ForkTest(unittest.TestCase):
         e = env("a=windows-x64", health({"denext-windows-x64": entry(2)}), RUNNER_WINDOWS_X64=WIN)
         e["GITHUB_EVENT_NAME"] = "pull_request_target"
         self.assertEqual(run(e)[0]["a"], "windows-latest")
+
+
+def health_pr(pools, labels, age=60):
+    """A health value with the top-level `pull_request_labels` (the pools that take a same-repo PR)."""
+    return json.dumps({"v": 1, "checked_at": NOW - age, "pools": pools, "pull_request_labels": labels})
+
+
+class SameRepoPullRequestTest(unittest.TestCase):
+    """A same-repo pull_request goes only to pools the scheduler hands one (`pull_request_labels`); the
+    rest take GitHub, so a job never queues on a pool that refuses it (2026-11-19: 8 h on Windows)."""
+
+    POOLS = {"denext-windows-x64": entry(2), "denext-windows-x64-fast": entry(1), "denext-linux-x64": entry(2),
+             "denext-windows-arm64": entry(1)}
+    VARS = {"RUNNER_WINDOWS_X64": WIN, "RUNNER_LINUX_X64": LINUX}
+
+    def pr_env(self, jobs, h, head="Brainwires/denext", **variables):
+        e = env(jobs, h, **(self.VARS | variables))
+        e.update(GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=ForkTest._event(self, head))
+        return e
+
+    def test_a_pool_that_takes_no_pull_request_sends_its_jobs_to_github(self):
+        h = health_pr(self.POOLS, ["denext-linux-x64", "DENEXT-LINUX-X64-DOCKER"])
+        plan, rows, _, warnings = run(self.pr_env("w=windows-x64 l=linux-x64", h))
+        self.assertEqual(plan, {"w": "windows-latest", "l": ours(LINUX)})
+        self.assertEqual(rows[0][2], "GitHub")
+        self.assertIn("denext-windows-x64 does not take pull requests", rows[0][3])
+        self.assertEqual(pr.LAST["blocked"], ["denext-windows-x64"])
+        self.assertEqual(pr.LAST["tripwire"], [])
+        self.assertTrue(any("denext-windows-x64" in w and "GitHub image" in w for w in warnings))
+
+    def test_listed_pools_take_it_case_insensitively_aliases_included(self):
+        h = health_pr(self.POOLS, ["Denext-Windows-X64", "denext-windows-x64-fast"])
+        plan, _, _, warnings = run(self.pr_env("t=windows-x64-fast s=windows-x64", h))
+        self.assertEqual(plan, {"t": ["self-hosted", "denext-windows-x64-fast"], "s": ours(WIN)})
+        self.assertEqual(pr.LAST["blocked"], [])
+        self.assertFalse(any("pull request" in w for w in warnings))
+
+    def test_without_the_list_every_pool_counts_as_refusing(self):
+        for h in (health(self.POOLS),
+                  health_pr(self.POOLS, "denext-windows-x64"),
+                  health_pr(self.POOLS, ["denext-windows-x64", 3]),
+                  health_pr(self.POOLS, ["denext-windows-x64"], age=pr.GITHUB_OFF_MAX_AGE + 1)):
+            plan, rows, _, warnings = run(self.pr_env("w=windows-x64 l=linux-x64", h))
+            self.assertEqual(plan, {"w": "windows-latest", "l": "ubuntu-latest"}, h)
+            self.assertTrue(all("no pull_request_labels" in r[3] for r in rows), rows)
+            self.assertTrue(warnings)
+
+    def test_the_list_holds_in_a_value_frozen_at_run_start(self):
+        h = health_pr(self.POOLS, ["denext-windows-x64"], age=40 * 60)
+        self.assertEqual(pr.pr_labels(h, NOW), {"denext-windows-x64"})
+        self.assertIsNone(pr.pr_labels(None, NOW))
+        self.assertIsNone(pr.pr_labels("nope", NOW))
+        self.assertEqual(pr.pr_labels(health_pr({}, []), NOW), set())
+
+    def test_a_pinned_job_on_a_refusing_pool_takes_its_image(self):
+        h = health_pr(self.POOLS, ["denext-linux-x64"])
+        plan, rows, _, _ = run(self.pr_env("a=windows-arm64! b=linux-x64!", h))
+        self.assertEqual(plan, {"a": "windows-11-arm", "b": ours(LINUX)})
+        self.assertIn("pinned", rows[0][3])
+        self.assertEqual(pr.LAST["blocked"], ["denext-windows-arm64"])
+
+    def test_the_routing_rules_never_hold_a_job_on_a_refusing_pool(self):
+        h = json.dumps({"v": 1, "checked_at": NOW - 60, "pools": self.POOLS, "pull_request_labels": [],
+                        "routing": {"v": 1, "classes": [{"labels": ["denext-windows-x64"], "github": False,
+                                                         "order": ["win-x64"]}]}})
+        plan, rows, _, _ = run(self.pr_env("w=windows-x64", h))
+        self.assertEqual(plan["w"], "windows-latest")
+        self.assertIn("does not take pull requests", rows[0][3])
+
+    def test_other_events_ignore_the_list(self):
+        h = health_pr(self.POOLS, [])
+        for event in ("push", "workflow_dispatch"):
+            e = env("w=windows-x64", h, **self.VARS)
+            e["GITHUB_EVENT_NAME"] = event
+            self.assertEqual(run(e)[0]["w"], ours(WIN), event)
+
+    def test_a_forks_pull_request_keeps_its_own_rule(self):
+        h = health_pr(self.POOLS, ["denext-windows-x64"])
+        plan, rows, _, _ = run(self.pr_env("w=windows-x64", h, head="someone/denext"))
+        self.assertEqual(plan["w"], "windows-latest")
+        self.assertIn("fork", rows[0][3])
+
+    def test_the_error_fallback_keeps_a_pinned_job_off_a_refusing_pool(self):
+        orig = pr.free_slots
+        pr.free_slots = lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            h = health_pr(self.POOLS, ["denext-linux-x64"])
+            plan, _, _, _ = run(self.pr_env("a=windows-x64 b=windows-arm64! c=linux-x64!", h,
+                                            RUNNER_WINDOWS_ARM='["self-hosted","denext-windows-arm64"]'))
+        finally:
+            pr.free_slots = orig
+        self.assertEqual(plan, {"a": "windows-latest", "b": "windows-11-arm", "c": ours(LINUX)})
+        self.assertEqual(pr.LAST["tripwire"], [])
 
 
 class FailureTest(unittest.TestCase):

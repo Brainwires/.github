@@ -121,6 +121,13 @@ those three with a Docker daemon. An idle `-2204` label is therefore no free cap
   picker runs before the jobs exist under names it could check.
 - Fork pull requests (and any `pull_request_*` but `pull_request` itself): GitHub images only,
   pinned jobs included, no API call.
+- Same-repo pull requests: only pools whose label is in the health's `pull_request_labels` (the
+  runs-on labels, aliases included, whose pools the fleet scheduler hands a `pull_request`: its
+  policy's `widened_labels`, published by the watchdog) take them. Every other pool's jobs, pinned
+  ones and routing-held ones included, take their GitHub image (the scheduler would refuse them,
+  and they would queue until GitHub drops them), and those labels are in `blocked`. With no
+  well-formed `pull_request_labels` (an older watchdog, or a value more than 6 h old) every pool
+  counts as refusing: all of the run's jobs take GitHub.
 - macOS: of the jobs past the threshold, at most `macos-cap` (default 3) per run go to GitHub (its
   ~5 org-wide macOS slots); the rest wait for our pool.
 - Re-runs: a pool whose job the previous attempt cancelled before any runner took it gets 0 free;
