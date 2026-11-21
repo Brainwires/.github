@@ -16,11 +16,12 @@ error annotation, the `tripwire` output and a line in the step summary.
 The SPILL BOUND (`spill_estimate`) caps how long a job may wait for our pools:
 with a fresh value whose routing class for the job may use GitHub, the job's
 start estimate on the class's pools, host by host (busy slots' live ETAs, the
-jobs ahead, hosts that cannot start a job now: an `onlyWhenIdle` hold, paused,
-disabled, down), past the class's `spillAfterMinutes` (default 20) sends it to
-GitHub at pick time: a queued job can be moved later only by cancelling its
-whole run, which a default branch never allows. An unknown estimate, or an
-aged or stale value, keeps ours.
+jobs ahead at a conservative job length, hosts that cannot start a job now: an
+`onlyWhenIdle` hold, paused, disabled, down), OR its expected wait, past the
+class's `spillAfterMinutes` (default 20) sends it to GitHub at pick time: a
+queued job can be moved later only by cancelling its whole run, which a default
+branch never allows. An aged or stale value keeps ours, and so does an unknown
+estimate while the expected wait is within the bound.
 
 The org's workflows run this through the composite action next to it
 (Brainwires/.github/actions/pick-runners). One picker job per workflow run
@@ -598,7 +599,7 @@ def hold_release(pool, ctx, now):
     return worst, f"{pool} held until {', '.join(ctx.pool_rules[pool])} idle (onlyWhenIdle; {'; '.join(why)}): ~{_fmt_min(round(worst / 60, 1))} min"
 
 
-def spill_estimate(label, taken, ctx, now):
+def spill_estimate(label, taken, ctx, now, job_minutes=None, wait=None):
     """The spill bound's input for one more job on `label`, whose slots are `taken` (busy, running, queued
     and this run's earlier placements, as in `label_load`): a dict {class, after (minutes), estimate
     (minutes until the job can start on one of the class's pools, or None: unknown), over (the estimate
@@ -613,15 +614,28 @@ def spill_estimate(label, taken, ctx, now):
     for the jobs ahead, a host the health does not list), make the estimate unknown: the job stays on
     our pool (fail toward our runners, never toward unbounded GitHub). The label's ETAs go to the
     available hosts' busy slots earliest first (the optimistic split: a spill needs a clear case), each
-    slot frees at the later of its ETA and its host's release, and the jobs ahead take the earliest free
-    slot for `job_s` each."""
+    slot frees at the later of its ETA and its host's release, and the jobs ahead (queued, and this run's
+    earlier placements) take the earliest free slot for a CONSERVATIVE job length each: the larger of
+    the label's median `job_s` and `job_minutes` (the pool's POOL_JOB_MINUTES). The median alone is far
+    too short for a gate's queue (2026-11-21, denext run 44854176122: linux-x64's median was 148 s, so
+    16 coverage / integration jobs ahead on 3 slots read 13 min; they waited over an hour).
+
+    `wait` (minutes, the job's expected wait from `job_wait`, or None) is the second opinion: the job is
+    `over` when EITHER number exceeds `after` (never the more optimistic one), an unknown estimate
+    included (`by` names what tipped it: "estimate" or "wait")."""
     rule = ctx.rules.get(label.lower()) if ctx else None
     if not rule:
         return None
     out = {"class": rule["class"], "after": rule["after"], "estimate": None, "over": False, "held": [], "why": ""}
+    wait_over = wait is not None and wait > rule["after"]
 
     def unknown(why):
-        out["why"] = f"start estimate unknown ({why}): ours"
+        if wait_over and rule["after"] > 0:
+            out["over"], out["by"] = True, "wait"
+            out["why"] = (f"start estimate unknown ({why}), but the expected wait {_fmt_min(round(wait, 1))} min"
+                          f" exceeds the spill bound {_fmt_min(rule['after'])} min")
+        else:
+            out["why"] = f"start estimate unknown ({why}): ours"
         return out
 
     if rule["after"] <= 0:
@@ -662,19 +676,25 @@ def spill_estimate(label, taken, ctx, now):
         times += [release] * max(0, slots - busy)
     label_busy = max(_n((entry or {}).get("busy")) or 0, len(etas))
     ahead = max(0, taken - label_busy)
+    per_job = max(job_s or 0, (job_minutes or 0) * 60)
     if not times:
         estimate = float("inf")
     else:
-        if ahead and not job_s:
+        if ahead and not per_job:
             return unknown(f"{ahead} job(s) ahead on {label} and no job duration")
-        estimate = min(_drain(times, ahead, job_s or 0)) / 60
+        estimate = min(_drain(times, ahead, per_job)) / 60
     out["estimate"] = estimate if estimate == float("inf") else round(estimate, 1)
-    out["over"] = estimate > rule["after"]
+    if estimate > rule["after"]:
+        out["over"], out["by"] = True, "estimate"
+    elif wait_over:
+        out["over"], out["by"] = True, "wait"
     pools_txt = " > ".join(rule["order"])
     held = "; ".join(out.get("holds", []) + [f"{p} cannot start jobs" for p in out["held"] if not any(
         h.startswith(p + " ") for h in out.get("holds", []))])
     out["why"] = (f"start estimate {_fmt_min(out['estimate'])} min on {pools_txt}"
-                  + (f" ({held})" if held else "") + (f", {ahead} job(s) ahead" if ahead else "")
+                  + (f" ({held})" if held else "")
+                  + (f", {ahead} job(s) ahead at ~{_fmt_min(round(per_job / 60, 1))} min each" if ahead else "")
+                  + (f", expected wait {_fmt_min(round(wait, 1))} min" if out.get("by") == "wait" else "")
                   + f", spill bound {_fmt_min(rule['after'])} min")
     return out
 
@@ -1015,9 +1035,10 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
     - the SPILL BOUND (`spill`, a SpillContext of a fresh value; `spill_estimate`): a job whose start
       estimate on its routing class's pools, host by host (busy slots' ETAs, the jobs ahead, hosts that
       cannot start now: an `onlyWhenIdle` hold, paused, disabled, down), exceeds the class's
-      `spillAfterMinutes` is past its threshold too, whatever the expected wait says (a slot held by a
-      rule looks free to it): GitHub, with the same exceptions as above (github_off, the macOS cap,
-      saturation). An unknown estimate never spills.
+      `spillAfterMinutes`, or whose expected wait does (never the more optimistic of the two), is past
+      its threshold too, whatever the expected wait says (a slot held by a rule looks free to it):
+      GitHub, with the same exceptions as above (github_off, the macOS cap, saturation). An unknown
+      estimate spills only on the expected wait.
 
     `mem` is {pool name: GB} (`mem_capacity`; POOL_MEM_GB for a pool it leaves out). Followers copy
     their target. Each row's `why` names the pool, the expected wait and the threshold. `records`, a
@@ -1166,7 +1187,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             stat = (f"expected wait {_fmt_min(round(wait, 1))} min ({binding}; {how}~{_fmt_min(round(per, 1))} min/job),"
                     f" threshold {_fmt_min(limit)} min")
             if spill is not None and now is not None and not notes.get(p.label):
-                sp = spill_estimate(p.label, label_load_.get(p.label, (0, 0))[1], spill, now)
+                sp = spill_estimate(p.label, label_load_.get(p.label, (0, 0))[1], spill, now,
+                                    job_minutes=POOL_JOB_MINUTES[p.name], wait=wait)
             if records is not None and sp is not None:
                 # JSON has no infinity: no pool of the class can start it at all is `estimate: null, over: true`
                 records[key]["spill"] = {k: (None if v == float("inf") else v) for k, v in sp.items() if k != "holds"}
@@ -1217,7 +1239,8 @@ def allocate(jobs, pools, free, groups, macos_cap, fork_pr, notes=None, saturate
             if notes.get(p.label):
                 why = notes[p.label]
             elif sp is not None and sp["over"]:
-                why = f"spill: {stat}: the start estimate exceeds the spill bound, GitHub"
+                what = "the expected wait" if sp.get("by") == "wait" else "the start estimate"
+                why = f"spill: {stat}: {what} exceeds the spill bound, GitHub"
             elif load is not None:
                 why = f"{stat}: exceeds it, GitHub"
             else:
@@ -1658,10 +1681,17 @@ def pick(env, get=None, runner_get=None, warn=lambda m: None, now=None, sleep=ti
 
 
 def spilled(decisions):
-    """[(key, spill dict)] of the jobs the spill bound sent to GitHub (see `allocate`)."""
-    return [(k, r["spill"]) for k, r in (decisions or {}).items()
+    """[(key, spill dict + the record's `wait`)] of the jobs the spill bound sent to GitHub (see `allocate`)."""
+    return [(k, dict(r["spill"], wait=r.get("wait"))) for k, r in (decisions or {}).items()
             if (r.get("spill") or {}).get("over") and isinstance(r.get("runs_on"), str)
             and GITHUB_IMAGE.match(r["runs_on"])]
+
+
+def _spill_txt(s):
+    """What tipped a spill, for the step summary: the start estimate, or the expected wait."""
+    if s.get("by") == "wait":
+        return f"expected wait {_fmt_min(s['wait'])} min" if s.get("wait") is not None else "expected wait"
+    return "no pool can start it" if s["estimate"] is None else _fmt_min(s["estimate"]) + " min"
 
 
 def table(rows, free, saturated=None, tripwire=None, spills=None):
@@ -1677,9 +1707,8 @@ def table(rows, free, saturated=None, tripwire=None, spills=None):
             f"{f} (queued {s // 60} min)" for f, s in sorted(saturated.items())))
     if spills:
         lines.append("")
-        lines.append("Spilled to GitHub (start estimate past the class's spill bound): " + ", ".join(
-            f"{k} ({'no pool can start it' if s['estimate'] is None else _fmt_min(s['estimate']) + ' min'}"
-            f" > {_fmt_min(s['after'])})" for k, s in spills))
+        lines.append("Spilled to GitHub (start estimate or expected wait past the class's spill bound): " + ", ".join(
+            f"{k} ({_spill_txt(s)} > {_fmt_min(s['after'])})" for k, s in spills))
     if tripwire:
         lines.append("")
         lines.append("**TRIPWIRE: on GitHub although our pool was healthy within the threshold:** " + ", ".join(

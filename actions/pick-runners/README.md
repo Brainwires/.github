@@ -76,7 +76,8 @@ job). A queued job can then only be moved by cancelling its whole run, which a d
 branch never allows, so the bound is applied at pick time: when the health is fresh and the job's
 routing class (the first published class that fits its label, repository and workflow) may use GitHub,
 the picker estimates when the job can START on the class's `order` pools, host by host, and a job whose
-estimate exceeds the class's `spillAfterMinutes` (default **20**; `0`: never) takes its GitHub image.
+estimate, OR whose expected wait, exceeds the class's `spillAfterMinutes` (default **20**; `0`: never)
+takes its GitHub image: the more pessimistic of the two numbers decides, never the more optimistic.
 
 - Hosts (the health's `hosts`): one that is not ok, paused (disabled included), or `down` / `paused` in
   the scheduler's pool-state (`state`, optional) starts nothing. One under an `onlyWhenIdle` rule (the
@@ -86,16 +87,21 @@ estimate exceeds the class's `spillAfterMinutes` (default **20**; `0`: never) ta
 - Slots: the label's live ETAs go to the available hosts' busy slots, earliest first (the optimistic
   split); each slot frees at the later of its ETA and its host's release, a free slot at its host's
   release. The jobs ahead (the label's queue and this run's own earlier placements) take the earliest
-  slot for `job_s` each; the estimate is the earliest time left.
-- Unknown keeps ours (fail toward our runners, never toward unbounded GitHub): an aged or stale value,
-  no `routing` or `hosts`, no class with GitHub for the label, no live ETAs, a busy slot without an ETA,
-  jobs ahead without `job_s`, a host the health does not list, a held pool's release that cannot be
-  computed, or a host `blocked` by any other gate (disk, RAM, …: no known end).
+  slot for a conservative job length each, the larger of the label's median `job_s` and the pool's
+  `POOL_JOB_MINUTES` (the median is far too short for a gate's queue: denext run 44854176122 read
+  linux-x64's 148 s median, estimated 13 min for 16 coverage / integration jobs ahead on 3 slots, and
+  waited over an hour); the estimate is the earliest time left.
+- An unknown estimate keeps ours unless the expected wait alone is past the bound (fail toward our
+  runners, never toward unbounded GitHub): no live ETAs, a busy slot without an ETA, a host the health
+  does not list, a held pool's release that cannot be computed, or a host `blocked` by any other gate
+  (disk, RAM, …: no known end). No bound applies at all (ours) with an aged or stale value, no `routing`
+  or `hosts`, or no class with GitHub for the label.
 - The other limits still apply past the bound: the `github_off` switch and GitHub saturation keep the
   job on our pool (`ours (waits)`), so does the macOS cap; fork and refused-pull-request rules come
   first. A spilled job takes no slot, so the next job is measured without it.
 - Logged: the row's `why` starts with `spill:` and names the estimate, the held hosts and the bound;
-  each decision line has `"spill": {class, after, estimate, over, held, why}` (`estimate: null` with
+  each decision line has `"spill": {class, after, estimate, over, by?, held, why}` (`by`: `"estimate"`
+  or `"wait"`, what tipped a spill; `estimate: null` with
   `over: true`: no pool of the class can start it at all; `spill: null`: no bound applied); the step
   summary lists the spilled jobs. A spilled job is never a tripwire (its expected wait may read 0).
 
