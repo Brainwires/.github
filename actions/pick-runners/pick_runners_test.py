@@ -1788,12 +1788,132 @@ class SpillTest(unittest.TestCase):
         self.assertEqual(json.loads(lines["plan"]), {"a": "windows-latest"})
         self.assertEqual(json.loads(lines["tripwire"]), [])
         self.assertIn('"spill":{"class":"windows-x64","after":20,"estimate":45', out.stderr)
-        self.assertIn("Spilled to GitHub (start estimate past the class's spill bound): a (45 min > 20)", out.stderr)
+        self.assertIn("Spilled to GitHub (start estimate or expected wait past the class's spill bound): a (45 min > 20)",
+                      out.stderr)
 
     def test_hold_release_unit(self):
         ctx = pr.spill_context(spill_health([], [[NOW, NOW - 300]]), NOW, "a/b", "")
         self.assertEqual(pr.hold_release("win-x64", ctx, NOW)[0], pr.OVERRUN_FLOOR)  # past its ETA: ends soon
         self.assertEqual(pr.hold_release("win-x64-brain", ctx, NOW), (0.0, ""))  # no rule
+
+
+LINUX_ROUTING = {"v": 1, "classes": [
+    {"id": "linux-x64", "labels": ["denext-linux-x64"], "github": True, "order": ["linux-x64"]},
+]}
+
+
+def linux_spill_health(live, queued, job_s=148, routing=None, extra_pools=None, **top):
+    """denext-linux-x64 (3 slots, one host) as the fleet published it during denext run 44854176122."""
+    pools = {"denext-linux-x64": live_entry(3, busy=len(live), live=live, job_s=job_s, queued=queued)}
+    pools.update(extra_pools or {})
+    return json.dumps(dict({"v": 1, "checked_at": NOW - 60, "pools": pools,
+                            "hosts": {"linux-x64": host("denext-linux-x64", slots=3, busy=len(live))},
+                            "routing": LINUX_ROUTING if routing is None else routing}, **top))
+
+
+class SpillEstimateTest(unittest.TestCase):
+    """The start estimate is conservative (long queued jobs) and never more optimistic than the wait."""
+
+    # the three busy slots free in 2, 5 and 8 min; 19 queued: 16 ahead of the first job of the run
+    LIVE = [[NOW - 600, NOW + 120], [NOW - 600, NOW + 300], [NOW - 600, NOW + 480]]
+    VARS = {"RUNNER_LINUX_X64": LINUX}
+
+    def pick(self, h, jobs="a=linux-x64", max_wait="linux=600", **kw):
+        # the threshold out of the way (linux=600): only the spill bound can send a job to GitHub
+        return records_of(env(jobs, h, max_wait=max_wait, **dict(self.VARS, **kw)))
+
+    def test_sixteen_long_jobs_ahead_on_three_slots_spill(self):
+        # denext run 44854176122: the median job (148 s) put the start 13 min out; the gate's coverage /
+        # integration jobs ahead ran 15-25 min each and the real wait was over an hour
+        h = linux_spill_health(self.LIVE, queued=19)
+        ctx = pr.spill_context(h, NOW, "a/b", "")
+        median_only = pr.spill_estimate("denext-linux-x64", 19, ctx, NOW)
+        self.assertLess(median_only["estimate"], 20)  # the old under-estimate
+        self.assertFalse(median_only["over"])
+        plan, rows, decisions, trip = self.pick(h, "a=linux-x64 b=linux-x64")
+        self.assertEqual(plan, {"a": "ubuntu-latest", "b": "ubuntu-latest"})
+        sp = decisions["a"]["spill"]
+        self.assertTrue(sp["over"])
+        self.assertEqual(sp["by"], "estimate")
+        self.assertGreater(sp["estimate"], 50)  # 16 jobs of 10 min (POOL_JOB_MINUTES) on 3 slots
+        self.assertIn("16 job(s) ahead at ~10 min each", sp["why"])
+        self.assertTrue(rows[0][3].startswith("spill: "), rows[0][3])
+        self.assertIn("the start estimate exceeds the spill bound", rows[0][3])
+        self.assertEqual(trip, [])
+
+    def test_this_runs_own_jobs_count_ahead_of_its_later_ones(self):
+        # an idle label: 3 free slots, 10-min jobs. a, b, c start now; d, e, f at 10; g, h, i at 20; j at 30
+        h = linux_spill_health([], queued=0)
+        plan, _, decisions, _ = self.pick(h, " ".join(f"{k}=linux-x64" for k in "abcdefghij"))
+        self.assertEqual([decisions[k]["spill"]["estimate"] for k in "abcdefghij"], [0] * 3 + [10] * 3 + [20] * 3 + [30])
+        self.assertEqual([plan[k] for k in "abcdefghij"], [ours(LINUX)] * 9 + ["ubuntu-latest"])
+
+    def test_a_longer_median_than_the_table_wins(self):
+        h = linux_spill_health(self.LIVE, queued=4, job_s=30 * 60)  # 1 ahead: frees at 2 min, +30
+        _, _, decisions, _ = self.pick(h)
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 5)  # the second slot (5 min) is earlier
+        h = linux_spill_health(self.LIVE, queued=6, job_s=30 * 60)  # 3 ahead: 2+30, 5+30, 8+30
+        _, _, decisions, _ = self.pick(h)
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 32)
+        self.assertTrue(decisions["a"]["spill"]["over"])
+
+    def test_no_median_falls_back_to_the_table(self):
+        h = linux_spill_health(self.LIVE, queued=6, job_s=None)  # 3 ahead at 10 min: 12, 15, 18 -> 12
+        _, _, decisions, _ = self.pick(h)
+        self.assertEqual(decisions["a"]["spill"]["estimate"], 12)
+        self.assertIn("3 job(s) ahead at ~10 min each", decisions["a"]["spill"]["why"])
+
+    def test_the_expected_wait_past_the_bound_spills_too(self):
+        # the label is idle (start estimate 0) but the linux host's shared slots are taken by the 22.04
+        # label's busy and queued jobs: the expected wait (table) is 25 min, past the 20-min bound
+        h = linux_spill_health([], queued=0, extra_pools={"denext-linux-x64-2204": entry(3, busy=3, queued=10)})
+        plan, rows, decisions, trip = self.pick(h, RUNNER_LINUX_X64_SHARED_SLOTS="3")
+        self.assertEqual(plan, {"a": "ubuntu-latest"})
+        self.assertEqual(decisions["a"]["wait"], 25)
+        sp = decisions["a"]["spill"]
+        self.assertEqual((sp["estimate"], sp["over"], sp["by"]), (0, True, "wait"))
+        self.assertIn("expected wait 25 min", sp["why"])
+        self.assertIn("the expected wait exceeds the spill bound", rows[0][3])
+        self.assertEqual(trip, [])
+        self.assertIn("a (expected wait 25 min > 20)", pr.table(rows, {}, spills=pr.spilled(decisions)))
+
+    def test_an_unknown_estimate_spills_on_the_expected_wait(self):
+        # no live ETAs (an older publisher): the estimate is unknown, the table's wait is 55 min
+        h = linux_spill_health([], queued=19)
+        v = json.loads(h)
+        del v["pools"]["denext-linux-x64"]["live"]
+        v["pools"]["denext-linux-x64"]["busy"] = 3
+        v["hosts"]["linux-x64"]["busy"] = 3
+        plan, rows, decisions, _ = self.pick(json.dumps(v))
+        self.assertEqual(plan, {"a": "ubuntu-latest"})
+        sp = decisions["a"]["spill"]
+        self.assertEqual((sp["estimate"], sp["over"], sp["by"]), (None, True, "wait"))
+        self.assertIn("start estimate unknown (no live ETAs for denext-linux-x64), but the expected wait 55 min",
+                      sp["why"])
+        # within the bound, an unknown estimate still keeps ours
+        v["pools"]["denext-linux-x64"]["queued"] = 0
+        plan, _, decisions, _ = self.pick(json.dumps(v))
+        self.assertEqual(plan, {"a": ours(LINUX)})
+        self.assertFalse(decisions["a"]["spill"]["over"])
+
+    def test_a_bound_of_0_never_spills_whatever_the_wait(self):
+        routing = {"v": 1, "classes": [dict(LINUX_ROUTING["classes"][0], spillAfterMinutes=0)]}
+        plan, _, decisions, _ = self.pick(linux_spill_health(self.LIVE, queued=19, routing=routing))
+        self.assertEqual(plan, {"a": ours(LINUX)})
+        self.assertFalse(decisions["a"]["spill"]["over"])
+
+    def test_the_github_off_switch_still_holds_the_run_of_44854176122(self):
+        # that run's ubuntu family was off: every job waits on our pool whatever the estimate
+        h = linux_spill_health(self.LIVE, queued=19, github_off=["ubuntu"])
+        plan, rows, decisions, _ = self.pick(h, "a=linux-x64 b=linux-x64", max_wait=None)
+        self.assertEqual(plan, {"a": ours(LINUX), "b": ours(LINUX)})
+        self.assertTrue(decisions["a"]["spill"]["over"])
+        self.assertIn("GitHub ubuntu is off", rows[0][3])
+        # and saturation keeps a bounded number on our pool
+        sat = linux_spill_health(self.LIVE, queued=19, github={"ubuntu": {"queued": 4, "oldest_at": NOW - 600}})
+        plan, rows, _, _ = self.pick(sat)
+        self.assertEqual((plan, rows[0][2]), ({"a": ours(LINUX)}, "ours (waits)"))
+        self.assertIn("saturated", rows[0][3])
 
 
 if __name__ == "__main__":
